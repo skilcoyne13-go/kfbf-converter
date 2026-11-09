@@ -1,0 +1,23 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.venv/
+env/
+venv/
+
+# Build and IDE artifacts
+dist/
+build/
+*.spec
+.vscode/
+.idea/
+
+# Large slide data (never commit raw images)
+*.kfbf
+*.ome.tif
+*.ome.tiff
+*.tif
+*.tiff
+output/

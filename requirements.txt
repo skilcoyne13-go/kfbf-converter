@@ -1,0 +1,5 @@
+tifffile>=2023.7.10
+imagecodecs>=2023.7.10
+numpy>=1.24.0
+pillow>=9.5.0
+tqdm>=4.65.0
