@@ -46,12 +46,14 @@ Dependencies: numpy, tifffile, imagecodecs, pillow, tqdm
 from __future__ import annotations
 
 import argparse
+import errno
 import io
 import logging
 import math
 import mmap
 import os
 import re
+import shutil
 import struct
 import sys
 import threading
@@ -143,6 +145,33 @@ class KFBFError(Exception):
 
 class SlideFormatError(KFBFError):
     """Raised for unreadable, malformed or unsupported slide files."""
+
+
+class DataTooBigError(KFBFError):
+    """An output cannot be written: file-format, file-system or free-space
+    limit. ``lines()`` gives the three user-facing lines."""
+
+    HEADLINE = "Data is too big for the file format chosen."
+
+    def __init__(self, reason: str, fix: str):
+        self.reason, self.fix = reason, fix
+        super().__init__(f"{self.HEADLINE} {reason} {fix}")
+
+    def lines(self) -> list[str]:
+        return [self.HEADLINE, f"  {self.reason}", f"  Fix: {self.fix}"]
+
+
+class VerificationError(KFBFError):
+    """A written output could not be read back correctly (it was deleted)."""
+
+    PREFIX = "Output failed verification and was deleted: "
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(self.PREFIX + reason)
+
+    def lines(self) -> list[str]:
+        return [str(self)]
 
 
 def jpeg_sof_info(data: bytes) -> dict | None:
@@ -960,6 +989,12 @@ class SVSSlide(_SlideBase):
     def missing_tiles(self) -> int:
         return int(sum(np.count_nonzero(i.counts == 0) for i in self._info))
 
+    def stored_bytes(self, level: int) -> tuple[int, int]:
+        """(encoded bytes, missing tiles) of the tiles a level export covers."""
+        info, lv = self._info[level], self.levels[level]
+        grid = info.counts.reshape(-1, info.stride)[:lv.grid_rows, :lv.grid_cols]
+        return int(grid.sum()), int(np.count_nonzero(grid == 0))
+
     def stored_size(self, level: int) -> tuple[int, int]:
         """(width, height) of the level as stored, including any padding."""
         return self._info[level].stored_size
@@ -1218,6 +1253,7 @@ class _PyramidWriter:
         self.workers = max(1, workers)
         self.jpeg_quality = jpeg_quality
         self.show_progress = show_progress
+        self.bigtiff = True  # always: classic TIFF stops at 4 GB
 
     def _compression_kwargs(self, rgb: bool) -> dict:
         kw: dict = {"compression": self.compression}
@@ -1252,8 +1288,9 @@ class _PyramidWriter:
         tile_shape = (ts, ts) + sample_shape
         bar = tqdm(total=total, desc=desc, unit="tile", leave=False,
                    disable=not self.show_progress, dynamic_ncols=True)
+        level_shapes = [(lv.height, lv.width) + sample_shape for lv in levels]
         try:
-            with tifffile.TiffWriter(tmp, bigtiff=True, ome=ome) as tif:
+            with tifffile.TiffWriter(tmp, bigtiff=self.bigtiff, ome=ome) as tif:
                 for lv in levels:
                     ncols, nrows = math.ceil(lv.width / ts), math.ceil(lv.height / ts)
                     jobs = ((p, tx, ty) for p in planes
@@ -1303,12 +1340,22 @@ class _PyramidWriter:
                     else:
                         kw.update(maxworkers=1)
                     tif.write(tiles(), **kw)
+            bar.close()
+            # Never leave a file the user can't open: read it back first.
+            verify_output(tmp, level_shapes, n_pages=len(planes), ome=ome)
             os.replace(tmp, out_path)
-        except BaseException:
+        except BaseException as exc:
+            try:
+                written = tmp.stat().st_size
+            except OSError:
+                written = 0
             try:
                 tmp.unlink()
             except OSError:
                 pass
+            mapped = map_write_error(exc, out_path, written)
+            if mapped is not None:
+                raise mapped from exc
             raise
         finally:
             bar.close()
@@ -1441,6 +1488,315 @@ def write_brightfield(slide: SVSSlide, out_path: Path, writer: _PyramidWriter,
 
 
 # --------------------------------------------------------------------------
+# Size checks ("Data is too big for the file format chosen.")
+# --------------------------------------------------------------------------
+
+GiB = 1024 ** 3
+CLASSIC_TIFF_MAX_BYTES = 4 * GiB - 1   # uint32 offsets
+FAT_MAX_FILE_BYTES = 4 * GiB - 1       # FAT12/16/32 per-file limit
+TIFF_MAX_DIM = 2 ** 32 - 1             # ImageWidth / ImageLength are uint32
+JPEG_MAX_DIM = 65535                   # per JPEG stream, i.e. per tile
+FAT_FILESYSTEMS = {"FAT", "FAT12", "FAT16", "FAT32", "VFAT", "MSDOS"}
+
+# Expected compressed/uncompressed ratio, calibrated on real KFBio slides
+# (worst seen: deflate 0.26, lzw 0.30, jpeg q90 0.073) with ~1.5x headroom
+# because tissue-dense slides compress worse than the samples did.
+COMPRESSION_FACTORS = {None: 1.0, "zlib": 0.40, "lzw": 0.45, "jpeg": 0.12}
+_COMPRESSION_LABEL = {None: "none", "zlib": "deflate", "lzw": "lzw", "jpeg": "jpeg"}
+
+
+def _gb(n: float) -> str:
+    return f"{n / GiB:.2f} GB"
+
+
+def compression_factor(compression: str | None, jpeg_quality: int = 90) -> float:
+    if compression == "jpeg" and jpeg_quality > 90:  # grows steeply near q100
+        return 0.12 + (min(jpeg_quality, 100) - 90) / 10 * 0.23
+    return COMPRESSION_FACTORS.get(compression, 1.0)
+
+
+@dataclass
+class SizeEstimate:
+    """Planned size of one output file (bytes)."""
+
+    estimate: int        # expected file size
+    uncompressed: int    # worst case: uncompressed pixel data + TIFF overhead
+    exact: bool          # True for tile copy: estimate is the real size
+    n_tiles: int         # tiles in the whole file
+    tiles_per_ifd: int   # largest tile count of one page
+    max_dim: int         # largest image width/height
+    tile_size: int
+    compression: str | None
+    overhead: int
+
+
+def _output_layout(slide, kind: str) -> tuple[int, int]:
+    """(samples per pixel, planes) of one output kind."""
+    if kind == "ome":
+        return 1, slide.n_z * slide.n_channels
+    if kind in ("rgb", "brightfield"):
+        return 3, slide.n_z
+    return 1, slide.n_z  # split
+
+
+def estimate_output(slide, kind: str, writer: "_PyramidWriter",
+                    copy_tiles: bool = False) -> SizeEstimate:
+    """Estimate one output's size: uncompressed = sum over exported levels of
+    tiles x tile_size^2 x samples x planes; expected = uncompressed x
+    compression factor (exact source bytes for a tile copy) + TIFF overhead
+    (tile offset/bytecount tables, IFDs, OME-XML)."""
+    samples, planes = _output_layout(slide, kind)
+    ts = slide.tile_size if copy_tiles else writer.ts
+    grids = [math.ceil(lv.width / ts) * math.ceil(lv.height / ts) for lv in writer.levels]
+    n_tiles = sum(grids) * planes
+    entry = 16 if writer.bigtiff else 8   # one offset + one bytecount
+    overhead = n_tiles * entry + len(writer.levels) * planes * 1024 + 256 * 1024
+    if kind == "ome":
+        overhead += planes * 512
+    uncompressed = n_tiles * ts * ts * samples + overhead
+    if copy_tiles:
+        data = 0
+        for lv in writer.levels:
+            stored, missing = slide.stored_bytes(lv.index)
+            data += stored + missing * 2048  # blank white tile is ~1-2 KB
+        estimate, exact = data * planes + overhead, True
+    else:
+        estimate = int(uncompressed * compression_factor(writer.compression,
+                                                         writer.jpeg_quality)) + overhead
+        exact = False
+    return SizeEstimate(estimate, uncompressed, exact, n_tiles, max(grids),
+                        max(max(lv.width, lv.height) for lv in writer.levels), ts,
+                        writer.compression, overhead)
+
+
+def _volume_root(path: Path) -> str:
+    """Drive / mount point that holds ``path`` (for messages)."""
+    path = Path(os.path.abspath(path))
+    if os.name == "nt":
+        buf = _volume_path_name(path)
+        if buf:
+            return buf
+        return path.anchor or str(path)
+    p = path
+    while not os.path.ismount(p) and p.parent != p:
+        p = p.parent
+    return str(p)
+
+
+def _volume_path_name(path: Path) -> str | None:
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        buf = ctypes.create_unicode_buffer(1024)
+        if k32.GetVolumePathNameW(ctypes.c_wchar_p(str(path)), buf, 1024):
+            return buf.value
+    except Exception:  # pragma: no cover - non-Windows or ctypes failure
+        pass
+    return None
+
+
+def filesystem_type(path: str | os.PathLike) -> str | None:
+    """File-system name of the volume holding ``path`` ('NTFS', 'exFAT',
+    'FAT32', 'ext4', ...), or None if it cannot be determined."""
+    path = Path(os.path.abspath(path))
+    if os.name == "nt":
+        root = _volume_path_name(path)
+        if not root:
+            return None
+        try:
+            import ctypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            fs = ctypes.create_unicode_buffer(261)
+            ok = k32.GetVolumeInformationW(ctypes.c_wchar_p(root), None, 0, None, None,
+                                           None, fs, 261)
+            return (fs.value or None) if ok else None
+        except Exception:  # pragma: no cover
+            return None
+    if sys.platform.startswith("linux"):
+        try:
+            real = os.path.realpath(path)
+            best, fstype = "", None
+            with open("/proc/self/mounts", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    mnt = parts[1].replace("\\040", " ")
+                    if (real == mnt or real.startswith(mnt.rstrip("/") + "/")) \
+                            and len(mnt) >= len(best):
+                        best, fstype = mnt, parts[2]
+            return fstype
+        except OSError:
+            return None
+    return None  # macOS etc.: not detected; the free-space check still runs
+
+
+def is_fat(fstype: str | None) -> bool:
+    return bool(fstype) and fstype.upper() in FAT_FILESYSTEMS
+
+
+def free_space_margin(estimate: int) -> int:
+    """Space kept free on top of the estimate: 256 MiB + 5 %."""
+    return 256 * 2 ** 20 + estimate // 20
+
+
+def preflight_check(est: SizeEstimate, out_path: Path, bigtiff: bool = True,
+                    jpeg_estimate: int | None = None) -> list[str]:
+    """Refuse an output that cannot fit; return warnings for ones that might not.
+
+    Raises DataTooBigError with the reason and a suggested fix.
+    ``jpeg_estimate`` is the size with --compression jpeg, used to suggest it.
+    """
+    name = out_path.name
+    warnings: list[str] = []
+    jpeg_hint = (f", or use --compression jpeg (about {_gb(jpeg_estimate)})"
+                 if jpeg_estimate is not None and jpeg_estimate < est.estimate else "")
+
+    # --- TIFF format limits ---------------------------------------------
+    if est.max_dim > TIFF_MAX_DIM:
+        raise DataTooBigError(
+            f"{name}: the image is {est.max_dim} px wide/high; TIFF stores "
+            f"sizes as 32-bit numbers (max {TIFF_MAX_DIM} px).",
+            "export fewer or smaller levels (--max-levels).")
+    if not bigtiff:
+        if est.estimate > CLASSIC_TIFF_MAX_BYTES:
+            raise DataTooBigError(
+                f"{name}: needs about {_gb(est.estimate)}, but classic TIFF files "
+                f"are limited to {_gb(CLASSIC_TIFF_MAX_BYTES + 1)}.",
+                "write BigTIFF" + jpeg_hint + ".")
+        if est.tiles_per_ifd > 2 ** 32 - 1:
+            raise DataTooBigError(
+                f"{name}: {est.tiles_per_ifd} tiles in one image exceed the classic "
+                f"TIFF limit of {2 ** 32 - 1}.", "write BigTIFF or use a larger --tile-size.")
+        if est.uncompressed > CLASSIC_TIFF_MAX_BYTES:
+            warnings.append(f"{name}: could exceed the 4 GB classic TIFF limit if it "
+                            f"compresses poorly (up to {_gb(est.uncompressed)}).")
+    if est.compression == "jpeg" and est.tile_size > JPEG_MAX_DIM:
+        raise DataTooBigError(
+            f"{name}: JPEG tiles are limited to {JPEG_MAX_DIM} px, tile size is "
+            f"{est.tile_size} px.", "use a smaller --tile-size.")
+
+    out_dir = out_path.parent
+    volume = _volume_root(out_dir)
+
+    # --- destination file system --------------------------------------------
+    fstype = filesystem_type(out_dir)
+    if is_fat(fstype):
+        if est.estimate > FAT_MAX_FILE_BYTES:
+            raise DataTooBigError(
+                f"{name}: would be about {_gb(est.estimate)}, but the output drive "
+                f"{volume} is {fstype}, which cannot store files larger than "
+                f"{_gb(FAT_MAX_FILE_BYTES + 1)}.",
+                "choose an NTFS or exFAT drive with -o" + jpeg_hint + ".")
+        if not est.exact and est.uncompressed > FAT_MAX_FILE_BYTES:
+            warnings.append(
+                f"{name}: the output drive {volume} is {fstype} (max 4 GB per file). "
+                f"Expected size is {_gb(est.estimate)}, but it could reach "
+                f"{_gb(est.uncompressed)} if the image compresses poorly. If it fails, "
+                f"choose an NTFS or exFAT drive with -o.")
+
+    # --- free space -------------------------------------------------------
+    try:
+        free = shutil.disk_usage(out_dir).free
+    except OSError:
+        free = None
+    if free is not None:
+        margin = free_space_margin(est.estimate)
+        if est.estimate + margin > free:
+            need = est.estimate + margin - free
+            raise DataTooBigError(
+                f"{name}: needs about {_gb(est.estimate)} (plus a {_gb(margin)} safety "
+                f"margin), but only {_gb(free)} is free on {volume}.",
+                f"free up {_gb(need)} on {volume}, or choose another drive with -o"
+                + jpeg_hint + ".")
+    return warnings
+
+
+# OSError codes meaning "disk full" / "file too large for this file system"
+_ENOSPC_WINERRORS = {112, 39}          # ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL
+_EFBIG_WINERRORS = {223, 665}          # ERROR_FILE_TOO_LARGE, ..._SYSTEM_LIMITATION
+
+
+def map_write_error(exc: BaseException, out_path: Path, written: int) -> DataTooBigError | None:
+    """Turn a disk-full / file-too-large error raised while writing into a
+    DataTooBigError with the real cause, or return None."""
+    name, out_dir = out_path.name, out_path.parent
+    volume = _volume_root(out_dir)
+    if isinstance(exc, OSError):
+        winerr = getattr(exc, "winerror", None)
+        fstype = filesystem_type(out_dir)
+        if exc.errno == errno.ENOSPC or winerr in _ENOSPC_WINERRORS:
+            try:
+                free = _gb(shutil.disk_usage(out_dir).free)
+            except OSError:
+                free = "?"
+            return DataTooBigError(
+                f"{name}: the drive {volume} ran out of space while writing "
+                f"({_gb(written)} written, {free} free).",
+                f"free up space on {volume}, or choose another drive with -o.")
+        near_fat_limit = is_fat(fstype) and written >= FAT_MAX_FILE_BYTES - 256 * 2 ** 20
+        if exc.errno == errno.EFBIG or winerr in _EFBIG_WINERRORS or near_fat_limit:
+            limit = (f"{fstype}, which cannot store files larger than "
+                     f"{_gb(FAT_MAX_FILE_BYTES + 1)}" if is_fat(fstype)
+                     else f"{fstype or 'its file system'}, which refused a larger file")
+            return DataTooBigError(
+                f"{name}: reached {_gb(written)}, but the output drive {volume} is {limit}.",
+                "choose an NTFS or exFAT drive with -o, or use --compression jpeg.")
+    if isinstance(exc, (ValueError, struct.error)):
+        msg = str(exc).lower()
+        if ("too large" in msg or "bigtiff" in msg or "exceeds" in msg
+                or ("out of range" in msg and isinstance(exc, struct.error))):
+            return DataTooBigError(f"{name}: tifffile refused the data ({exc}).",
+                                   "write BigTIFF, or use --compression jpeg.")
+    return None
+
+
+def verify_output(path: Path, level_shapes: Sequence[tuple], n_pages: int,
+                  ome: bool = False) -> None:
+    """Re-open a written file and check it is usable: page and SubIFD counts,
+    the shape of every level, tile data inside the file, and one decoded
+    tile per level. Raises VerificationError."""
+    try:
+        size = path.stat().st_size
+        with tifffile.TiffFile(path) as tif:
+            pages = tif.pages
+            if len(pages) != n_pages:
+                raise VerificationError(f"expected {n_pages} image page(s), found {len(pages)}")
+            if ome and not tif.is_ome:
+                raise VerificationError("OME-XML metadata is missing")
+            fh = tif.filehandle
+            for pi in range(n_pages):
+                top = pages[pi]
+                subs = tifffile.TiffPages(top) if top.subifds else []
+                levels = [top] + list(subs)
+                if len(levels) != len(level_shapes):
+                    raise VerificationError(f"expected {len(level_shapes)} pyramid level(s), "
+                                            f"found {len(levels)}")
+                for li, (pg, shape) in enumerate(zip(levels, level_shapes)):
+                    if tuple(pg.shape) != tuple(shape):
+                        raise VerificationError(f"level {li} has shape {tuple(pg.shape)}, "
+                                                f"expected {tuple(shape)}")
+                    offs = np.asarray(pg.dataoffsets, np.int64)
+                    cnts = np.asarray(pg.databytecounts, np.int64)
+                    if len(offs) == 0 or (cnts <= 0).any() or (offs + cnts > size).any():
+                        raise VerificationError(f"level {li} tile data is missing or past "
+                                                f"the end of the file (truncated?)")
+                    if pi == 0:  # decode one tile per level
+                        j = len(offs) // 2
+                        decode, tables = pg.decode, pg.jpegtables  # may seek: get first
+                        fh.seek(int(offs[j]))
+                        data = fh.read(int(cnts[j]))
+                        seg = decode(data, j, jpegtables=tables)[0]
+                        if seg is None or np.asarray(seg).size == 0:
+                            raise VerificationError(f"level {li} tile {j} decoded to nothing")
+    except VerificationError:
+        raise
+    except Exception as exc:
+        raise VerificationError(f"could not read it back ({type(exc).__name__}: {exc})") \
+            from exc
+
+
+# --------------------------------------------------------------------------
 # High-level conversion
 # --------------------------------------------------------------------------
 
@@ -1474,6 +1830,27 @@ DEFAULT_COMPRESSION = "deflate"
 DEFAULT_TILE_SIZE = 512
 
 
+def report_output_error(exc: DataTooBigError | VerificationError) -> None:
+    """Print a user-facing failure message (no traceback) above progress bars."""
+    for line in exc.lines():
+        tqdm.write(line, file=sys.stderr)
+
+
+def _preflight_output(slide, kind: str, out: Path, writer: _PyramidWriter,
+                      copy_tiles: bool) -> SizeEstimate:
+    est = estimate_output(slide, kind, writer, copy_tiles)
+    jpeg_est = None
+    if not copy_tiles and writer.compression != "jpeg":
+        jpeg_est =int((est.uncompressed - est.overhead) * compression_factor("jpeg")) \
+            + est.overhead
+    log.debug("%s: preflight estimate %s (uncompressed bound %s, %s, %d tiles)", out.name,
+              _gb(est.estimate), _gb(est.uncompressed),
+              "exact" if est.exact else _COMPRESSION_LABEL.get(writer.compression), est.n_tiles)
+    for msg in preflight_check(est, out, writer.bigtiff, jpeg_est):
+        log.warning("%s", msg)
+    return est
+
+
 def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None = None,
                   mode: str | None = "ome", compression: str | None = None,
                   tile_size: int | None = None,
@@ -1481,13 +1858,22 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
                   channel_names: Sequence[str] | None = None, low_pct: float = 0.1,
                   high_pct: float = 99.9, jpeg_quality: int = 90,
                   show_progress: bool = True, min_level_size: int = 256,
-                  max_levels: int | None = None) -> list[Path]:
+                  max_levels: int | None = None, preflight: bool = True,
+                  errors: list | None = None) -> list[Path]:
     """Convert one .kfbf (fluorescence) or .svs (brightfield) slide.
 
     Returns the list of files written. ``mode`` applies to fluorescence
     slides; brightfield slides always produce ``<stem>.tif``.
     ``compression`` / ``tile_size`` default to deflate / 512 px; for
     brightfield, leaving both unset copies the stored JPEG tiles unchanged.
+
+    Before each output is written its size is checked against the TIFF
+    format, the destination file system and the free space
+    (``preflight=False`` skips this). An output that is too big
+    (DataTooBigError) or fails read-back verification (VerificationError)
+    is deleted. If ``errors`` is a list, such per-output failures are
+    printed and appended to it as ``(output_path, exception)`` and the
+    remaining outputs are still written; otherwise the exception is raised.
     """
     if mode is not None and mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
@@ -1525,18 +1911,39 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
         writer = _PyramidWriter(slide, tile_size or DEFAULT_TILE_SIZE,
                                 compression or DEFAULT_COMPRESSION, workers, jpeg_quality,
                                 show_progress, levels=export)
-        for kind, out, ch in planned_outputs(slide, out_dir, mode):
+        jobs = planned_outputs(slide, out_dir, mode)
+        for _, out, _ in jobs:  # leftovers of an earlier crashed/killed run
+            stale = out.with_name(out.name + ".part")
+            if stale.exists():
+                try:
+                    stale.unlink()
+                    log.info("removed stale partial file %s left by an earlier "
+                             "interrupted run", stale)
+                except OSError as exc:
+                    log.warning("could not remove stale partial file %s: %s", stale, exc)
+        for kind, out, ch in jobs:
             if out.exists() and not overwrite:
                 log.info("skip existing %s (use --overwrite)", out)
                 continue
-            if kind == "brightfield":
-                write_brightfield(slide, out, writer, copy_tiles=copy_tiles)
-            elif kind == "ome":
-                write_ome(slide, out, writer)
-            elif kind == "rgb":
-                write_rgb(slide, out, writer, low_pct, high_pct)
-            else:
-                write_split(slide, out, ch, writer)
+            try:
+                if preflight:
+                    _preflight_output(slide, kind, out, writer, copy_tiles and
+                                      kind == "brightfield")
+                if kind == "brightfield":
+                    write_brightfield(slide, out, writer, copy_tiles=copy_tiles)
+                elif kind == "ome":
+                    write_ome(slide, out, writer)
+                elif kind == "rgb":
+                    write_rgb(slide, out, writer, low_pct, high_pct)
+                else:
+                    write_split(slide, out, ch, writer)
+            except (DataTooBigError, VerificationError) as exc:
+                if errors is None:
+                    raise
+                report_output_error(exc)
+                log.debug("%s failed", out, exc_info=True)
+                errors.append((out, exc))
+                continue
             log.info("wrote %s", out)
             written.append(out)
         if slide.decode_failures:
@@ -1610,6 +2017,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="drop pyramid levels whose larger side is below this (default: 256)")
     p.add_argument("--max-levels", type=int, default=None,
                    help="cap the number of exported pyramid levels (incl. full resolution)")
+    p.add_argument("--no-preflight", action="store_true",
+                   help="skip the size check before writing (use only if it wrongly "
+                        "refuses an output; written files are still verified)")
     p.add_argument("--info", action="store_true", help="print parsed slide structure and exit")
     p.add_argument("-q", "--quiet", action="store_true", help="hide progress bars")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
@@ -1749,6 +2159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for s in tqdm(slides, desc="Slides", unit="slide", disable=args.quiet or len(slides) < 2,
                   dynamic_ncols=True):
         out_dir = args.output_dir or s.parent
+        output_errors: list = []
         try:
             n_written += len(convert_slide(
                 s, out_dir, mode=args.mode, compression=args.compression,
@@ -1756,14 +2167,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 workers=args.workers, channel_names=args.channel_names,
                 low_pct=args.low_pct, high_pct=args.high_pct,
                 jpeg_quality=args.jpeg_quality, show_progress=not args.quiet,
-                min_level_size=args.min_level_size, max_levels=args.max_levels))
+                min_level_size=args.min_level_size, max_levels=args.max_levels,
+                preflight=not args.no_preflight, errors=output_errors))
         except KeyboardInterrupt:
             log.error("interrupted")
             return 130
+        except (DataTooBigError, VerificationError) as exc:  # raised outside an output
+            report_output_error(exc)
+            log.debug("traceback", exc_info=True)
+            failures.append((s, exc.lines()[0] if isinstance(exc, VerificationError)
+                             else f"{exc.HEADLINE} {exc.reason}"))
         except Exception as exc:
             log.error("%s: conversion failed: %s", s.name, exc,
                       exc_info=args.verbose)
             failures.append((s, str(exc)))
+        for out, exc in output_errors:
+            failures.append((out, str(exc) if isinstance(exc, VerificationError)
+                             else f"{exc.HEADLINE} {exc.reason}"))
 
     log.info("done: %d slide(s), %d file(s) written, %d failure(s)",
              len(slides), n_written, len(failures))
