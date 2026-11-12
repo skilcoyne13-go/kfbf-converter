@@ -101,6 +101,39 @@ def test_svs_tiles_match_tifffile_and_missing_is_white(svs, tmp_path):
         assert (out[50:, :] == 255).all() and (out[:, 50:] == 255).all()
 
 
+def test_svs_short_level_extended_with_white(tmp_path):
+    """Level stored 2 px narrower than half its parent (257 -> 255) is declared
+    at 257 px, which needs an extra tile column that reads as white."""
+    info = make_svs(tmp_path / "short.svs", width=1028, height=600, missing=(),
+                    pad_last=False, shrink_last=2)
+    assert info.stored_sizes[2] == (255, 150)
+    with kc.open_slide(info.path) as s:
+        lv = s.levels[2]
+        assert (lv.width, lv.height, lv.grid_cols) == (257, 150, 2)
+        assert "extended with white" in s.summary()
+        assert s.raw_tile(2, 1, 0) is None             # beyond the stored grid
+        assert s.stored_bytes(2)[1] == 1                # counted as one blank tile
+        region = s.read_region(2, 0, 0, 257, 150)
+        assert (region[:, 255:] == 255).all()
+        with tifffile.TiffFile(info.path) as t:
+            np.testing.assert_array_equal(region[:, :255], t.pages[3].asarray())
+    out = tmp_path / "out"
+    (p,) = kc.convert_slide(info.path, out, show_progress=False)   # tile copy
+    with tifffile.TiffFile(p) as t:
+        assert len(t.series) == 1
+        assert [lv.shape for lv in t.series[0].levels] == [(600, 1028, 3), (300, 514, 3),
+                                                           (150, 257, 3)]
+        last = t.series[0].levels[2].asarray()
+    assert np.abs(last[:, :255].astype(int) - region[:, :255]).max() == 0
+    assert (last[:, 256:] >= 254).all()   # added tile column: blank white JPEG
+    # column 255 is the scanner's own JPEG padding, copied unchanged (KFBio
+    # repeats the edge pixel there; this synthetic file pads with black)
+    (p2,) = kc.convert_slide(info.path, tmp_path / "re", compression="deflate",
+                             show_progress=False)
+    with tifffile.TiffFile(p2) as t:
+        assert (t.series[0].levels[2].asarray()[:, 255:] == 255).all()   # re-encode: white
+
+
 def test_svs_synthetic_levels_rgb(tmp_path):
     info = make_svs(tmp_path / "one.svs", width=1100, height=300, n_levels=1, missing=())
     with kc.open_slide(info.path) as s:

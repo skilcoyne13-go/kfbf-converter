@@ -26,3 +26,6 @@ output/
 
 # Test cache
 .pytest_cache/
+
+# Windows folder settings
+desktop.ini

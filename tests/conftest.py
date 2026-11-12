@@ -173,8 +173,13 @@ def _zero_tile_bytecounts(path: Path, page_index: int, tile_indices) -> None:
 
 def make_svs(path: Path, width: int = 1400, height: int = 1000, mpp: float = 0.5,
              n_levels: int = 3, pad_last: bool = True, missing=((0, 1, 1),),
-             quality: int = 90, aperio: bool = True) -> SvsInfo:
-    """Write a synthetic KFBio-style Aperio .svs (classic TIFF)."""
+             quality: int = 90, aperio: bool = True, shrink_last: int = 0) -> SvsInfo:
+    """Write a synthetic KFBio-style Aperio .svs (classic TIFF).
+
+    ``pad_last`` pads the last level with white (as in KFBio's Sample2);
+    ``shrink_last`` instead stores it that many pixels too narrow (as in a
+    KFBio H&E slide whose 4609 px level is followed by a 2303 px one).
+    """
     img = _rgb_pattern(height, width)
     desc = ("Aperio Image Library Synthetic\r\n"
             f"{width}x{height} [0,0 {width}x{height}] (256x256) JPEG/RGB Q={quality}"
@@ -186,7 +191,10 @@ def make_svs(path: Path, width: int = 1400, height: int = 1000, mpp: float = 0.5
             w, h = math.ceil(w / 2), math.ceil(h / 2)
         level = img[::2 ** li, ::2 ** li][:h, :w].copy() if li else img
         sw, sh = w, h
-        if pad_last and li == n_levels - 1 and li > 0:
+        if shrink_last and li == n_levels - 1 and li > 0:
+            sw = w - shrink_last
+            level = level[:, :sw].copy()
+        elif pad_last and li == n_levels - 1 and li > 0:
             sw, sh = -(-w // 32) * 32, -(-h // 32) * 32   # pad like KFBio, with white
             padded = np.full((sh, sw, 3), 255, np.uint8)
             padded[:h, :w] = level

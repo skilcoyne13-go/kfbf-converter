@@ -824,6 +824,20 @@ def _float_or_none(text) -> float | None:
     return v if math.isfinite(v) else None
 
 
+def _exact_step(stored: int, parent: int, ratio: int, tolerance: float = 0.02) -> int:
+    """Size of a level that is exactly ``parent / ratio`` (floor or ceil).
+
+    A larger stored size is padding and is always cropped (as before). A
+    smaller one is extended with white only if it is within ``tolerance``
+    (or 2 px) of the exact size; otherwise the stored size is kept."""
+    lo, hi = parent // ratio, -(-parent // ratio)
+    if stored > hi:
+        return hi
+    if stored >= lo or lo - stored > max(2, tolerance * lo):
+        return stored
+    return max(lo, 1)
+
+
 @dataclass
 class _SVSLevelInfo:
     """Where one SVS pyramid level's tiles live and how they are encoded."""
@@ -943,13 +957,15 @@ class SVSSlide(_SlideBase):
             if abs(log2 - round(log2)) < 0.15:  # Aperio pads level sizes
                 ds = float(2 ** round(log2))
                 if levels:
-                    # KFBio pads small levels (e.g. 1628x2305 stored as
-                    # 1632x2320, padding is white): declare the true size so
-                    # the pyramid steps are exact. Tiles are unchanged.
+                    # KFBio level sizes are not exact steps: some are padded
+                    # with white (1628x2305 stored as 1632x2320), some are a
+                    # pixel or two short (2303 for half of 4609). Declare an
+                    # exact step so readers see one pyramid: crop the padding,
+                    # or extend short levels with white. Tiles are unchanged.
                     r = ds / levels[-1].downsample
                     if r == int(r):
-                        w = min(w, math.ceil(levels[-1].width / r))
-                        h = min(h, math.ceil(levels[-1].height / r))
+                        w = _exact_step(w, levels[-1].width, int(r))
+                        h = _exact_step(h, levels[-1].height, int(r))
             stride = math.ceil(stored[0] / self.tile_size)
             ncols, nrows = math.ceil(w / self.tile_size), math.ceil(h / self.tile_size)
             offsets = np.asarray(pg.dataoffsets, np.int64)
@@ -995,16 +1011,26 @@ class SVSSlide(_SlideBase):
         """(encoded bytes, missing tiles) of the tiles a level export covers."""
         info, lv = self._info[level], self.levels[level]
         grid = info.counts.reshape(-1, info.stride)[:lv.grid_rows, :lv.grid_cols]
-        return int(grid.sum()), int(np.count_nonzero(grid == 0))
+        beyond = lv.grid_rows * lv.grid_cols - grid.size  # declared past the stored grid
+        return int(grid.sum()), int(np.count_nonzero(grid == 0)) + beyond
 
     def stored_size(self, level: int) -> tuple[int, int]:
         """(width, height) of the level as stored, including any padding."""
         return self._info[level].stored_size
 
+    def _size_note(self, lv: Level) -> str:
+        sw, sh = self.stored_size(lv.index)
+        if (sw, sh) == (lv.width, lv.height):
+            return ""
+        how = ("padding cropped" if sw >= lv.width and sh >= lv.height else
+               "extended with white" if sw <= lv.width and sh <= lv.height else "adjusted")
+        return f" (stored {sw}x{sh}, {how})"
+
     def summary(self, min_level_size: int = 256, max_levels: int | None = None) -> str:
         info0 = self._info[0]
         sub = self.jpeg_subsampling(0) if info0.compression == _TIFF_JPEG else None
-        scanner = (self.description.split("|", 1)[0].strip().splitlines() or ["-"])[0]             if self.is_aperio else "-"
+        scanner = ((self.description.split("|", 1)[0].strip().splitlines() or ["-"])[0]
+                   if self.is_aperio else "-")
         lines = [
             f"File          : {self.path}",
             f"Type          : brightfield RGB ({'Aperio SVS' if self.is_aperio else 'TIFF'}, "
@@ -1027,8 +1053,7 @@ class SVSSlide(_SlideBase):
                 f" {'*' if lv.index in exported else ' '}[{lv.index:2d}] "
                 f"{lv.width:>7d} x {lv.height:<7d} ds {lv.downsample:<8g}"
                 + (" (synthetic)" if lv.synthetic else f" grid {lv.grid_cols}x{lv.grid_rows}"
-                   + ("" if self.stored_size(lv.index) == (lv.width, lv.height) else
-                      " (stored %dx%d, padding cropped)" % self.stored_size(lv.index))))
+                   + self._size_note(lv)))
         return "\n".join(lines)
 
     # ---- pixel access ----------------------------------------------------
@@ -1041,8 +1066,10 @@ class SVSSlide(_SlideBase):
     def raw_tile(self, level: int, col: int, row: int) -> bytes | None:
         """The stored (still encoded) bytes of one source tile, or None if missing."""
         info, lv = self._info[level], self.levels[level]
-        if not (0 <= col < lv.grid_cols and 0 <= row < lv.grid_rows):
-            return None
+        stored_rows = len(info.offsets) // info.stride
+        if not (0 <= col < min(lv.grid_cols, info.stride)
+                and 0 <= row < min(lv.grid_rows, stored_rows)):
+            return None  # outside the image, or white padding added past the stored grid
         i = row * info.stride + col
         off, cnt = int(info.offsets[i]), int(info.counts[i])
         return self._mm[off:off + cnt] if cnt > 0 else None
@@ -1068,6 +1095,15 @@ class SVSSlide(_SlideBase):
                                    row * self._info[level].stride + col)
                 h, w = min(arr.shape[0], ts), min(arr.shape[1], ts)
                 tile[:h, :w] = arr[:h, :w, :3]
+                # Pixels past the stored image are encoder padding, not
+                # image: make them white (matters where a short level was
+                # extended to the exact pyramid size).
+                sw, sh = self._info[level].stored_size
+                vx, vy = sw - col * ts, sh - row * ts
+                if vx < ts:
+                    tile[:, max(vx, 0):] = 255
+                if vy < ts:
+                    tile[max(vy, 0):, :] = 255
             except Exception as exc:
                 self._note_decode_failure(f"L{level} c{col} r{row}", exc)
         return self._cache_put(key, tile)

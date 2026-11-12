@@ -309,15 +309,17 @@ schema specifies. For example, blue (DAPI) is `65535` and red is `-16776961`.
 ### The `.svs` brightfield format (as written by KFBio)
 
 KFBio scanners write brightfield scans as Aperio-style `.svs` files. SVS is a
-standard tiled TIFF, so nothing needed reverse engineering; the layout below
-was confirmed by inspecting a real KFBio `.svs` (26046 × 36880 px, 20×) with
-`tifffile`. Fields marked *unverified* were not present in that sample.
+standard tiled TIFF, so nothing needed reverse engineering. The layout below
+was confirmed by inspecting three real KFBio `.svs` slides with `tifffile`:
+H&E and AB-PAS stains, 11999 × 12321 to 73744 × 45156 px, all 20×. The
+"sample" column refers to the 26046 × 36880 px one. Fields marked
+*unverified* were not present in any of them.
 
 **File header**
 
 | Offset | Type | Field |
 |---|---|---|
-| `0x00` | 4 bytes | `49 49 2A 00` (`II*\0`): little-endian **classic** TIFF. (`II+\0` = BigTIFF, also accepted) |
+| `0x00` | 4 bytes | `49 49 2A 00` (`II*\0`): little-endian **classic** TIFF, or `49 49 2B 00` (`II+\0`): **BigTIFF**, which KFBio uses for large slides (the 73744 × 45156 px H&E) |
 | `0x04` | uint32 | Offset of the first IFD |
 
 **Pages (IFDs)**, in file order:
@@ -326,7 +328,7 @@ was confirmed by inspecting a real KFBio `.svs` (26046 × 36880 px, 20×) with
 |---|---|---|---|
 | 0 | Level 0 (full resolution) | 26046 × 36880 | tiled 256 × 256, JPEG, YCbCr |
 | 1 | Thumbnail | 820 × 1164 | stripped, JPEG |
-| 2 – 7 | Levels 1 – 6, each exactly ½ the previous | 13023 × 18440 … 408 × 580 | tiled 256 × 256, JPEG, YCbCr |
+| 2 – 7 | Levels 1 – 6, each about ½ the previous (see *Level sizes*) | 13023 × 18440 … 408 × 580 | tiled 256 × 256, JPEG, YCbCr |
 | 8 | Slide **label** (`subfiletype = 1`) | 1164 × 968 | LZW, RGB |
 | 9 | **Macro** overview (`subfiletype = 9`) | 2940 × 968 | JPEG |
 
@@ -342,7 +344,25 @@ no Adobe `APP14` marker and no shared `JPEGTables` tag (abbreviated tiles with
 converter reads the subsampling from each level's JPEG `SOF` header instead.
 Tiles stored with photometric RGB (the "Aperio RGB JPEG" variant) are decoded
 as RGB, not YCbCr (*unverified on KFBio files*). Zero-length tiles are
-treated as **white** (blank glass); the sample had none.
+treated as **white** (blank glass); none of the samples had any.
+
+**Level sizes**: each level is downsampled exactly 2× (no stretching: checked
+by comparing each level with the one above it, averaged 2 × 2), but the
+*stored* size isn't always an exact half, and it varies between slides:
+
+| Slide | Example | What KFBio stored |
+|---|---|---|
+| 26046 × 36880 | half of 3255 × 4610 is 1628 × 2305 | **1632 × 2320**: padded with white |
+| 11999 × 12321 | half of 11999 × 12321 is 5999.5 × 6160.5 | 5999 × 6160: rounded down (fine) |
+| 73744 × 45156 | half of 4609 × 2822 is 2304.5 × 1411 | **2303** × 1411: 1 – 2 px short |
+
+Readers like `tifffile` only treat a level as part of the pyramid if it is
+exactly ½ (rounded either way), and the converter's own geometry is exact too.
+So the converter declares the exact size: larger stored levels are cropped
+(only padding is removed), and levels up to 2 % (or 2 px) short are
+extended. The added pixels read as white. A tile copy keeps the scanner's own
+JPEG tile, whose encoder padding repeats the edge pixel. `--info` marks
+these levels, e.g. `(stored 2303x1411, extended with white)`.
 
 **Metadata**: every page's `ImageDescription` reads like
 `Aperio Format Scanned By KFBIO | 26046x36879 [0,0 26046x36879] (256x256), JPEG/RGB Q=30|AppMag = 20|MPP = 0.485896|...`.
