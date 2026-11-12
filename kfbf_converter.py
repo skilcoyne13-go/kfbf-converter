@@ -57,6 +57,7 @@ import shutil
 import struct
 import sys
 import threading
+import xml.etree.ElementTree as ElementTree
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -321,6 +322,14 @@ class Level:
     raw_grid: tuple = ()     # raw record fields +0x08/+0x0C (diagnostic)
 
 
+MIN_MAGNIFICATION, MAX_MAGNIFICATION = 0.5, 250.0
+
+
+def format_magnification(value: float) -> str:
+    """40.0 -> '40', 2.5 -> '2.5'."""
+    return f"{value:g}"
+
+
 class _SlideBase:
     """Shared reader machinery: read-only mmap, lifecycle, LRU tile cache,
     synthetic pyramid levels and tiled region reads.
@@ -386,6 +395,28 @@ class _SlideBase:
 
     def level_mpp(self, level: int) -> float:
         return self.mpp * self.levels[level].downsample
+
+    def _resolve_magnification(self, from_file, source: str,
+                               override: float | None) -> None:
+        """Objective magnification: ``override`` (--magnification) wins, else
+        the file's value if plausible, else 0 (= unknown)."""
+        if override is not None:
+            self.magnification, self.magnification_source = float(override), "--magnification"
+            return
+        value = _float_or_none(from_file)
+        if value is not None and MIN_MAGNIFICATION <= value <= MAX_MAGNIFICATION:
+            self.magnification, self.magnification_source = value, source
+        else:
+            self.magnification, self.magnification_source = 0.0, "missing"
+            if value:  # present but implausible
+                self._warn(f"implausible magnification {value:g} in file; ignored "
+                           f"(set --magnification)")
+
+    def magnification_text(self) -> str:
+        """e.g. '40x (header)' or 'unknown (set --magnification)'."""
+        if not self.magnification:
+            return "unknown (set --magnification)"
+        return f"{format_magnification(self.magnification)}x ({self.magnification_source})"
 
     # ---- helpers ---------------------------------------------------------
     def _add_synthetic_levels(self, levels: list[Level]) -> list[Level]:
@@ -471,10 +502,12 @@ class KFBioSlide(_SlideBase):
     min_file_size = 0x60
 
     def __init__(self, path: str | os.PathLike, mpp_fallback: float = DEFAULT_MPP,
-                 channel_names: Sequence[str] | None = None, tile_cache: int = 1024):
+                 channel_names: Sequence[str] | None = None, tile_cache: int = 1024,
+                 magnification: float | None = None):
         super().__init__(path, tile_cache)
         try:
             self._parse_header(mpp_fallback)
+            self._resolve_magnification(self.header_magnification, "header", magnification)
             self._parse_metadata()
             self._parse_index()
             self._resolve_channels(channel_names)
@@ -489,7 +522,7 @@ class KFBioSlide(_SlideBase):
         if mm[0:4] != MAGIC or mm[4:8] != SIGNATURE:
             raise KFBFError(f"not a KFBF file (bad magic/signature)")
         (self.version,) = struct.unpack_from("<f", mm, 0x0C)
-        self.n_records, self.height, self.width, self.magnification = \
+        self.n_records, self.height, self.width, self.header_magnification = \
             struct.unpack_from("<4I", mm, 0x10)
         self.codec = bytes(mm[0x20:0x28]).split(b"\0", 1)[0].decode("ascii", "replace")
         (self.index_offset,) = struct.unpack_from("<Q", mm, 0x44)
@@ -624,9 +657,9 @@ class KFBioSlide(_SlideBase):
         recs = self._records
         scales = np.unique(recs["scale"])[::-1]  # high -> low magnification
         s0 = float(scales[0])
-        if self.magnification and abs(s0 - self.magnification) > 0.5:
+        if self.header_magnification and abs(s0 - self.header_magnification) > 0.5:
             log.debug("top level scale %.3f differs from header magnification %d",
-                      s0, self.magnification)
+                      s0, self.header_magnification)
 
         # Z planes
         zvals = np.unique(recs["z"])
@@ -699,7 +732,9 @@ class KFBioSlide(_SlideBase):
         lines = [
             f"File          : {self.path}",
             f"Version       : {self.version:.3g}   codec: {self.codec}",
-            f"Dimensions    : {self.width} x {self.height} px  @ {self.magnification}x",
+            f"Dimensions    : {self.width} x {self.height} px  @ "
+            f"{format_magnification(self.magnification)}x",
+            f"Magnification : {self.magnification_text()}",
             f"MPP           : {self.mpp:.5g} um/px"
             + ("" if self.mpp_from_header else " (fallback)"),
             f"Channels ({self.n_channels}) : "
@@ -877,7 +912,7 @@ class SVSSlide(_SlideBase):
     channel_colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
 
     def __init__(self, path: str | os.PathLike, mpp_fallback: float = DEFAULT_MPP,
-                 tile_cache: int = 256):
+                 tile_cache: int = 256, magnification: float | None = None):
         # RGB tiles are 3x the size of fluorescence tiles: 256 x 192 KB = 48 MB
         super().__init__(path, tile_cache)
         self._tif = None
@@ -885,7 +920,7 @@ class SVSSlide(_SlideBase):
             if bytes(self._mm[:4]) not in TIFF_MAGICS:
                 raise SlideFormatError("not a TIFF/SVS file (bad magic)")
             self._tif = tifffile.TiffFile(self.path)
-            self._parse(mpp_fallback)
+            self._parse(mpp_fallback, magnification)
         except Exception:
             self.close()
             raise
@@ -898,7 +933,7 @@ class SVSSlide(_SlideBase):
         super().close()
 
     # ---- parsing ---------------------------------------------------------
-    def _parse(self, mpp_fallback: float) -> None:
+    def _parse(self, mpp_fallback: float, magnification: float | None = None) -> None:
         tif = self._tif
         self.is_bigtiff = tif.is_bigtiff
         self.is_aperio = tif.is_svs
@@ -909,8 +944,8 @@ class SVSSlide(_SlideBase):
                            if self.is_aperio else {})
         self.width, self.height = int(base.imagewidth), int(base.imagelength)
         self.codec = getattr(base.compression, "name", str(base.compression))
-        mag = _float_or_none(self.properties.get("AppMag"))
-        self.magnification = int(round(mag)) if mag else 0
+        self._resolve_magnification(self.properties.get("AppMag"), "Aperio AppMag",
+                                    magnification)
 
         # Pixel size: Aperio "MPP =", else TIFF resolution tags, else fallback
         mpp = _float_or_none(self.properties.get("MPP"))
@@ -1036,7 +1071,9 @@ class SVSSlide(_SlideBase):
             f"Type          : brightfield RGB ({'Aperio SVS' if self.is_aperio else 'TIFF'}, "
             f"{'BigTIFF' if self.is_bigtiff else 'classic TIFF'})",
             f"Scanner       : {scanner}",
-            f"Dimensions    : {self.width} x {self.height} px  @ {self.magnification}x",
+            f"Dimensions    : {self.width} x {self.height} px  @ "
+            f"{format_magnification(self.magnification)}x",
+            f"Magnification : {self.magnification_text()}",
             f"MPP           : {self.mpp:.5g} um/px"
             + ("" if self.mpp_source == "description" else f" ({self.mpp_source})"),
             f"Tiles         : {self.tile_size}x{self.tile_size} {self.codec}, photometric "
@@ -1186,8 +1223,10 @@ def detect_slide_type(path: str | os.PathLike) -> str | None:
 def open_slide(path: str | os.PathLike, **kw) -> KFBioSlide | SVSSlide:
     """Open a slide with the right reader: magic bytes first, extension second.
 
-    Keyword arguments (``mpp_fallback``, ``channel_names``, ``tile_cache``)
-    are passed to the reader; ``channel_names`` is ignored for brightfield.
+    Keyword arguments (``mpp_fallback``, ``channel_names``, ``tile_cache``,
+    ``magnification``) are passed to the reader; ``channel_names`` is ignored
+    for brightfield. ``magnification`` overrides the objective magnification
+    stored in the file.
     """
     path = Path(path)
     by_magic = detect_slide_type(path)
@@ -1207,8 +1246,10 @@ def open_slide(path: str | os.PathLike, **kw) -> KFBioSlide | SVSSlide:
                     "reading it as %s", path.name, by_ext, by_magic, by_magic)
     if kind == "fluorescence":
         return KFBioSlide(path, **{k: v for k, v in kw.items()
-                                   if k in ("mpp_fallback", "channel_names", "tile_cache")})
-    return SVSSlide(path, **{k: v for k, v in kw.items() if k in ("mpp_fallback", "tile_cache")})
+                                   if k in ("mpp_fallback", "channel_names", "tile_cache",
+                                            "magnification")})
+    return SVSSlide(path, **{k: v for k, v in kw.items()
+                             if k in ("mpp_fallback", "tile_cache", "magnification")})
 
 
 # --------------------------------------------------------------------------
@@ -1308,13 +1349,16 @@ class _PyramidWriter:
               fetch: Callable[[int, object, int, int], np.ndarray],
               photometric: str, metadata: dict | None, ome: bool, desc: str,
               tile_size: int | None = None,
-              encoded: Callable[[Level], dict] | None = None) -> Path:
+              encoded: Callable[[Level], dict] | None = None,
+              finalize: Callable[[Path], None] | None = None) -> Path:
         """fetch(level, plane, tx, ty) -> tile array (ts, ts, *sample_shape).
 
         With ``encoded``, fetch returns already-compressed JPEG tile bytes
         instead, and ``encoded(level)`` gives the matching tifffile kwargs
         (``subsampling``, ``jpegtables``); ``tile_size`` overrides the
         writer's tile size (it must equal the source tile size then).
+        ``finalize(part_path)`` may edit the finished file (e.g. metadata)
+        before it is verified and renamed.
         """
         slide, ts = self.slide, tile_size or self.ts
         levels = self.levels
@@ -1379,6 +1423,8 @@ class _PyramidWriter:
                         kw.update(maxworkers=1)
                     tif.write(tiles(), **kw)
             bar.close()
+            if finalize is not None:
+                finalize(tmp)
             # Never leave a file the user can't open: read it back first.
             verify_output(tmp, level_shapes, n_pages=len(planes), ome=ome)
             os.replace(tmp, out_path)
@@ -1406,6 +1452,52 @@ def _region(slide: "_SlideBase", level: int, tx: int, ty: int, ts: int) -> tuple
     return x, y, min(ts, lv.width - x), min(ts, lv.height - y)
 
 
+OME_NS = "http://www.openmicroscopy.org/Schemas/OME/2016-06"
+# OME 2016-06 schema order: OME = ... Experimenter*, ExperimenterGroup*, Instrument*, Image* ...;
+# Image = ..., InstrumentRef?, ObjectiveSettings?, ImagingEnvironment?, StageLabel?, Pixels, ...
+_OME_BEFORE_INSTRUMENT_REFS = ("<ImagingEnvironment", "<StageLabel", "<Pixels")
+
+
+def ome_add_objective(xml: str, magnification: float) -> str:
+    """Return OME-XML with ``Instrument > Objective NominalMagnification`` and
+    every ``Image`` linked to it (``InstrumentRef`` + ``ObjectiveSettings``),
+    inserted where the OME 2016-06 schema requires them."""
+    if "<Instrument" in xml or "<ObjectiveSettings" in xml:
+        raise ValueError("OME-XML already has an Instrument / ObjectiveSettings")
+    first_image = re.search(r"<Image[\s>]", xml)
+    if first_image is None:
+        raise ValueError("OME-XML has no Image element")
+    mag = f"{float(magnification):.1f}" if float(magnification).is_integer() \
+        else f"{float(magnification):g}"
+    instrument = (f'<Instrument ID="Instrument:0"><Objective ID="Objective:0:0" '
+                  f'NominalMagnification="{mag}"/></Instrument>')
+    refs = '<InstrumentRef ID="Instrument:0"/><ObjectiveSettings ID="Objective:0:0"/>'
+
+    def link(m: re.Match) -> str:
+        image = m.group(0)
+        at = min((i for i in (image.find(t) for t in _OME_BEFORE_INSTRUMENT_REFS) if i > 0),
+                 default=-1)
+        if at < 0:
+            raise ValueError("OME Image element has no Pixels")
+        return image[:at] + refs + image[at:]
+
+    i = first_image.start()
+    xml = xml[:i] + instrument + re.sub(r"<Image[\s>].*?</Image>", link, xml[i:], flags=re.S)
+    ElementTree.fromstring(xml.encode("utf-8"))  # must still be well-formed
+    return xml
+
+
+def set_ome_magnification(path: Path, magnification: float) -> None:
+    """Rewrite the OME-XML ImageDescription of an OME-TIFF in place so it
+    records the objective magnification (tifffile's writer can't)."""
+    with tifffile.TiffFile(path) as tif:
+        tag = tif.pages[0].tags["ImageDescription"]
+        tif.filehandle.seek(tag.valueoffset)
+        raw = tif.filehandle.read(tag.count)
+    xml = raw.rstrip(b"\0").decode("utf-8")
+    tifffile.tiffcomment(path, ome_add_objective(xml, magnification).encode("utf-8"))
+
+
 def write_ome(slide: KFBioSlide, out_path: Path, writer: _PyramidWriter) -> Path:
     """Multi-channel pyramidal OME-TIFF: (C,Y,X) or (Z,C,Y,X) per level."""
     planes = [(z, c) for z in range(slide.n_z) for c in range(slide.n_channels)]
@@ -1431,10 +1523,14 @@ def write_ome(slide: KFBioSlide, out_path: Path, writer: _PyramidWriter) -> Path
         x, y, w, h = _region(slide, level, tx, ty, writer.ts)
         return slide.read_region(level, x, y, w, h, c, z)
 
+    def finalize(tmp: Path) -> None:
+        if slide.magnification:
+            set_ome_magnification(tmp, slide.magnification)
+
     return writer.write(out_path, planes=planes, lead_shape=(slide.n_z, slide.n_channels),
                         sample_shape=(), fetch=fetch,
                         photometric="minisblack", metadata=metadata, ome=True,
-                        desc=f"OME  {slide.path.stem}")
+                        desc=f"OME  {slide.path.stem}", finalize=finalize)
 
 
 def write_rgb(slide: KFBioSlide, out_path: Path, writer: _PyramidWriter,
@@ -1902,7 +1998,8 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
                   high_pct: float = 99.9, jpeg_quality: int = 90,
                   show_progress: bool = True, min_level_size: int = 256,
                   max_levels: int | None = None, preflight: bool = True,
-                  errors: list | None = None) -> list[Path]:
+                  errors: list | None = None,
+                  magnification: float | None = None) -> list[Path]:
     """Convert one .kfbf (fluorescence) or .svs (brightfield) slide.
 
     Returns the list of files written. ``mode`` applies to fluorescence
@@ -1917,6 +2014,9 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
     is deleted. If ``errors`` is a list, such per-output failures are
     printed and appended to it as ``(output_path, exception)`` and the
     remaining outputs are still written; otherwise the exception is raised.
+
+    ``magnification`` overrides the objective magnification stored in the
+    slide (written to the OME-XML ``Objective``).
     """
     if mode is not None and mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
@@ -1925,7 +2025,8 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
     out_dir.mkdir(parents=True, exist_ok=True)
     workers = workers or min(8, os.cpu_count() or 1)
     written: list[Path] = []
-    with open_slide(path, mpp_fallback=mpp, channel_names=channel_names) as slide:
+    with open_slide(path, mpp_fallback=mpp, channel_names=channel_names,
+                    magnification=magnification) as slide:
         export = select_export_levels(slide.levels, min_level_size, max_levels)
         levels_txt = ", ".join(f"{lv.width}x{lv.height}" for lv in export)
         copy_tiles = False
@@ -2047,6 +2148,9 @@ def build_parser() -> argparse.ArgumentParser:
                         f"keeps the source tile size)")
     p.add_argument("--mpp", type=float, default=DEFAULT_MPP,
                    help=f"fallback µm/px if missing from header (default: {DEFAULT_MPP})")
+    p.add_argument("--magnification", type=float, default=None, metavar="X",
+                   help="objective magnification, e.g. 40 (default: from the slide); "
+                        "use if the slide's value is missing or wrong")
     p.add_argument("--overwrite", action="store_true", help="overwrite existing outputs")
     p.add_argument("--recursive", action="store_true",
                    help="search sub-directories for .kfbf/.svs")
@@ -2159,6 +2263,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.tile_size is not None and (args.tile_size < 16 or args.tile_size % 16):
         log.error("--tile-size must be a positive multiple of 16")
         return 2
+    if args.magnification is not None and not (
+            MIN_MAGNIFICATION <= args.magnification <= MAX_MAGNIFICATION):
+        log.error("--magnification must be between %g and %g",
+                  MIN_MAGNIFICATION, MAX_MAGNIFICATION)
+        return 2
     if not 0 <= args.low_pct < args.high_pct <= 100:
         log.error("require 0 <= --low-pct < --high-pct <= 100")
         return 2
@@ -2191,8 +2300,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         rc = 0
         for s in slides:
             try:
-                with open_slide(s, mpp_fallback=args.mpp,
-                                channel_names=args.channel_names) as slide:
+                with open_slide(s, mpp_fallback=args.mpp, channel_names=args.channel_names,
+                                magnification=args.magnification) as slide:
                     print(slide.summary(args.min_level_size, args.max_levels), end="\n\n")
             except Exception as exc:
                 log.error("%s: %s", s.name, exc)
@@ -2213,7 +2322,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 low_pct=args.low_pct, high_pct=args.high_pct,
                 jpeg_quality=args.jpeg_quality, show_progress=not args.quiet,
                 min_level_size=args.min_level_size, max_levels=args.max_levels,
-                preflight=not args.no_preflight, errors=output_errors))
+                preflight=not args.no_preflight, errors=output_errors,
+                magnification=args.magnification))
         except KeyboardInterrupt:
             log.error("interrupted")
             return 130

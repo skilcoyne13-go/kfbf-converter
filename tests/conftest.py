@@ -60,7 +60,8 @@ class KfbfInfo:
 
 def make_kfbf(path: Path, width: int = 700, height: int = 520,
               channels=("DAPI", "FITC", "TRITC"), n_z: int = 1, mpp: float = 0.2528,
-              missing=((0, 0, 1, 1),), quality: int = 95) -> KfbfInfo:
+              missing=((0, 0, 1, 1),), quality: int = 95,
+              magnification: int = 40) -> KfbfInfo:
     """Write a synthetic .kfbf. ``missing`` = tiles (level, z, col, row) with no record."""
     c = len(channels)
     info = KfbfInfo(path, width, height, list(channels), n_z, mpp, [], set(missing))
@@ -125,7 +126,7 @@ def make_kfbf(path: Path, width: int = 700, height: int = 520,
 
     struct.pack_into("<4s4s", body, 0, b"\xf1\x01\xee\xee", b"KFBF")
     struct.pack_into("<f", body, 0x0C, 2.1)
-    struct.pack_into("<4I", body, 0x10, len(records), height, width, 40)
+    struct.pack_into("<4I", body, 0x10, len(records), height, width, magnification)
     body[0x20:0x28] = b"JPEG\0\0\0\0"
     struct.pack_into("<Q", body, 0x44, index_offset)
     struct.pack_into("<f", body, 0x4C, mpp)

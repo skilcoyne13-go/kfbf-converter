@@ -110,8 +110,8 @@ the output that fits its type
 python kfbf_converter.py "C:\path\to\slides" --mode all -o "C:\path\to\output"
 ```
 
-**Inspect a slide** (dimensions, pixel size, channels, pyramid levels), without
-converting it:
+**Inspect a slide** (dimensions, magnification, pixel size, channels, pyramid
+levels), without converting it:
 ```bash
 python kfbf_converter.py slide.kfbf --info
 python kfbf_converter.py slide.svs --info
@@ -159,6 +159,7 @@ copy is both the smallest and the most faithful option.
 | `--recursive` | off | Also convert slides in sub-folders |
 | `--channel-names` | from slide | Rename the channels, e.g. `--channel-names DAPI CD3 CD8` (fluorescence only) |
 | `--mpp` | `0.2528` | Pixel size (µm/px), used only if the slide doesn't contain one |
+| `--magnification` | from slide | Objective magnification (e.g. `40`), if the slide's value is missing or wrong |
 | `--tile-size` | `512` (`.svs` tile copy: `256`) | Output tile size in pixels |
 | `--min-level-size` | `256` | Smallest pyramid level to keep, in pixels |
 | `--no-preflight` | off | Skip the size check before writing (see below) |
@@ -219,6 +220,11 @@ verified.
    and set its display range.
 3. Channel names, colours and the pixel size (µm) are already set, so
    measurements and scale bars are calibrated from the start.
+4. The objective magnification (e.g. 40×) is stored in the OME-XML
+   (`Instrument > Objective > NominalMagnification`). In the **Image** tab,
+   **Magnification** should read 40, and at full resolution the toolbar zoom
+   should show **40.0x** instead of "1.0x". *This was checked against the OME
+   schema, but not yet in QuPath itself.*
 
 **Brightfield (`.tif` from `.svs`)**
 
@@ -425,8 +431,12 @@ convert_slide("slide.svs", "output/")
 convert_slide("slide.svs", "output/", compression="jpeg")
 ```
 
-`convert_slide` also takes `preflight=True` (set it to `False` to skip the size
-check) and `errors=None`. By default a refused or unverifiable output raises
+`convert_slide` also takes `magnification=None` (overrides the slide's
+objective magnification, like `--magnification`), `preflight=True` (set it
+to `False` to skip the size check) and `errors=None`. Readers and
+`open_slide` accept `magnification=` too; `slide.magnification` is the
+value used (0 = unknown) and `slide.magnification_source` says where it came
+from (`header`, `Aperio AppMag`, `--magnification` or `missing`). By default a refused or unverifiable output raises
 `DataTooBigError` / `VerificationError`. If you pass a list, those failures are
 printed and appended as `(output_path, exception)`, and the remaining outputs
 are still written. `DataTooBigError.lines()` returns the three user-facing
