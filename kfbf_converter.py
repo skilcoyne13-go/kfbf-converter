@@ -127,6 +127,95 @@ class KFBFError(Exception):
     """Raised for unreadable or malformed .kfbf files."""
 
 
+class SlideFormatError(KFBFError):
+    """Raised for unreadable, malformed or unsupported slide files."""
+
+
+def jpeg_sof_info(data: bytes) -> dict | None:
+    """Parse JPEG markers up to SOS: size, components, Adobe/JFIF presence.
+
+    Returns ``{"width", "height", "components": [(id, h, v), ...],
+    "adobe_transform": int | None, "jfif": bool}`` or None if no SOF found.
+    """
+    info: dict = {"adobe_transform": None, "jfif": False}
+    i, n = 2, len(data)
+    if data[:2] != b"\xff\xd8":
+        return None
+    while i + 4 <= n and data[i] == 0xFF:
+        m = data[i + 1]
+        if m == 0xFF:  # fill byte
+            i += 1
+            continue
+        if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:
+            i += 2
+            continue
+        seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+        seg = data[i + 4:i + 2 + seg_len]
+        if m == 0xE0 and seg[:5] == b"JFIF\0":
+            info["jfif"] = True
+        elif m == 0xEE and seg[:5] == b"Adobe" and len(seg) >= 12:
+            info["adobe_transform"] = seg[11]
+        elif m in (0xC0, 0xC1, 0xC2, 0xC3) and len(seg) >= 6:
+            nc = seg[5]
+            info["height"] = int.from_bytes(seg[1:3], "big")
+            info["width"] = int.from_bytes(seg[3:5], "big")
+            info["components"] = [(seg[6 + 3 * k], seg[7 + 3 * k] >> 4, seg[7 + 3 * k] & 15)
+                                  for k in range(nc) if 8 + 3 * k <= len(seg)]
+            return info
+        elif m == 0xDA:
+            break
+        i += 2 + seg_len
+    return None
+
+
+def _merge_jpeg_tables(tables: bytes | None, data: bytes) -> bytes:
+    """Splice TIFF JPEGTables (abbreviated table spec) into an abbreviated tile."""
+    if not tables:
+        return data
+    return bytes(tables[:-2]) + bytes(data[2:])  # drop tables' EOI and tile's SOI
+
+
+def decode_jpeg_rgb(data: bytes, tables: bytes | None = None,
+                    rgb_stored: bool = False) -> np.ndarray:
+    """Decode a colour JPEG payload to an (h, w, 3) uint8 RGB array.
+
+    Unlike :func:`decode_jpeg`, colour is kept. ``rgb_stored`` means the
+    container says the samples were stored as RGB (TIFF photometric RGB),
+    i.e. *no* YCbCr transform, even when the stream has no Adobe marker, as
+    in some Aperio files. Otherwise the JPEG's own markers decide (JFIF /
+    component IDs 1-2-3 = YCbCr, Adobe transform 0 or IDs 'R','G','B' = RGB).
+    imagecodecs is used first, Pillow as a fallback.
+    """
+    arr = None
+    if imagecodecs is not None:
+        kw = {"colorspace": "RGB", "outcolorspace": "RGB"} if rgb_stored else {}
+        try:
+            arr = imagecodecs.jpeg_decode(data, tables=tables or None, **kw)
+        except Exception:
+            arr = None
+    if arr is None:
+        if Image is None:
+            raise KFBFError("neither imagecodecs nor Pillow could decode JPEG")
+        with Image.open(io.BytesIO(_merge_jpeg_tables(tables, data))) as im:
+            im.load()
+            if rgb_stored and im.mode == "RGB":
+                # libjpeg treated the raw RGB samples as YCbCr and converted
+                # them; undoing that conversion recovers the stored values.
+                im = im.convert("YCbCr")
+            elif im.mode != "RGB":
+                im = im.convert("RGB")
+            arr = np.asarray(im)
+    if arr.ndim == 2:
+        arr = np.repeat(arr[..., None], 3, axis=2)
+    elif arr.shape[2] == 1:
+        arr = np.repeat(arr, 3, axis=2)
+    elif arr.shape[2] > 3:
+        arr = arr[..., :3]
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
+
+
 def channel_color(name: str, index: int = 0) -> tuple[int, int, int]:
     """Default pseudo-colour for a fluorophore name (falls back to index)."""
     upper = re.sub(r"[^A-Z0-9]", "", name.upper())
@@ -188,24 +277,26 @@ class Level:
     raw_grid: tuple = ()     # raw record fields +0x08/+0x0C (diagnostic)
 
 
-class KFBioSlide:
-    """Reader for KFBio fluorescent ``.kfbf`` slides.
+class _SlideBase:
+    """Shared reader machinery: read-only mmap, lifecycle, LRU tile cache,
+    synthetic pyramid levels and tiled region reads.
 
-    Parameters
-    ----------
-    path : path to the .kfbf file
-    mpp_fallback : pixel size (µm/px) used when the header value is invalid
-    channel_names : optional override of the channel labels
-    tile_cache : number of decoded 256x256 tiles kept in an LRU cache
+    Subclasses set ``levels``, ``n_source_levels``, ``z_values``, ``mpp`` and
+    implement their own ``get_tile`` / ``read_region``.
     """
 
-    def __init__(self, path: str | os.PathLike, mpp_fallback: float = DEFAULT_MPP,
-                 channel_names: Sequence[str] | None = None, tile_cache: int = 1024):
+    kind = ""              # "fluorescence" | "brightfield"
+    is_rgb = False
+    fill_value = 0         # value of missing tiles / out-of-bounds pixels
+    tile_size = SRC_TILE   # source tile size
+    min_file_size = 8
+
+    def __init__(self, path: str | os.PathLike, tile_cache: int = 1024):
         self.path = Path(path)
         self._fh = open(self.path, "rb")
         try:
             self.file_size = os.fstat(self._fh.fileno()).st_size
-            if self.file_size < 0x60:
+            if self.file_size < self.min_file_size:
                 raise KFBFError(f"file too small ({self.file_size} bytes)")
             self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
         except Exception:
@@ -216,15 +307,6 @@ class KFBioSlide:
         self._lock = threading.Lock()
         self.decode_failures = 0
         self.warnings: list[str] = []
-        try:
-            self._parse_header(mpp_fallback)
-            self._parse_metadata()
-            self._parse_index()
-            self._resolve_channels(channel_names)
-            self._build_levels()
-        except Exception:
-            self.close()
-            raise
 
     # ---- lifecycle -------------------------------------------------------
     def close(self) -> None:
@@ -234,7 +316,7 @@ class KFBioSlide:
         if not self._fh.closed:
             self._fh.close()
 
-    def __enter__(self) -> "KFBioSlide":
+    def __enter__(self):
         return self
 
     def __exit__(self, *exc) -> None:
@@ -243,6 +325,119 @@ class KFBioSlide:
     def _warn(self, msg: str) -> None:
         self.warnings.append(msg)
         log.warning("%s: %s", self.path.name, msg)
+
+    # ---- properties ------------------------------------------------------
+    @property
+    def n_levels(self) -> int:
+        return len(self.levels)
+
+    @property
+    def n_z(self) -> int:
+        return len(self.z_values)
+
+    @property
+    def dimensions(self) -> tuple[int, int]:
+        """(width, height) of level 0."""
+        return self.levels[0].width, self.levels[0].height
+
+    def level_mpp(self, level: int) -> float:
+        return self.mpp * self.levels[level].downsample
+
+    # ---- helpers ---------------------------------------------------------
+    def _add_synthetic_levels(self, levels: list[Level]) -> list[Level]:
+        """Append 2x-downsampled levels until the pyramid is small enough."""
+        while max(levels[-1].width, levels[-1].height) > MIN_PYRAMID_DIM:
+            p = levels[-1]
+            levels.append(Level(len(levels), p.scale / 2, max(1, math.ceil(p.width / 2)),
+                                max(1, math.ceil(p.height / 2)), 0, 0,
+                                p.downsample * 2, synthetic=True))
+        return levels
+
+    def _cache_get(self, key):
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit is not None:
+                self._cache.move_to_end(key)
+            return hit
+
+    def _cache_put(self, key, tile: np.ndarray) -> np.ndarray:
+        tile.flags.writeable = False
+        if self._cache_size:
+            with self._lock:
+                self._cache[key] = tile
+                if len(self._cache) > self._cache_size:
+                    self._cache.popitem(last=False)
+        return tile
+
+    def _note_decode_failure(self, what: str, exc: Exception) -> None:
+        with self._lock:
+            self.decode_failures += 1
+            first = self.decode_failures == 1
+        if first:
+            log.warning("%s: tile decode failed (%s): %s", self.path.name, what, exc)
+
+    def _read_plane(self, level: int, x: int, y: int, width: int, height: int,
+                    tile_fn: Callable[[int, int, int], np.ndarray],
+                    sample_shape: tuple = ()) -> np.ndarray:
+        """Assemble a (height, width, *sample_shape) region from source tiles
+        (``tile_fn(level, col, row)``) or, for synthetic levels, by 2x2
+        averaging the parent level with edge replication."""
+        out = np.full((height, width) + sample_shape, self.fill_value, np.uint8)
+        lv = self.levels[level]
+        x0, y0 = max(x, 0), max(y, 0)
+        x1, y1 = min(x + width, lv.width), min(y + height, lv.height)
+        if x1 <= x0 or y1 <= y0:
+            return out
+        if lv.synthetic:
+            pw, ph = 2 * (x1 - x0), 2 * (y1 - y0)
+            parent = self.levels[level - 1]
+            src = self._read_plane(level - 1, 2 * x0, 2 * y0, pw, ph, tile_fn, sample_shape)
+            vw, vh = min(pw, parent.width - 2 * x0), min(ph, parent.height - 2 * y0)
+            if vw < pw or vh < ph:  # replicate edge instead of averaging with fill
+                pad = ((0, ph - vh), (0, pw - vw)) + ((0, 0),) * len(sample_shape)
+                src = np.pad(src[:vh, :vw], pad, mode="edge")
+            small = src.reshape((ph // 2, 2, pw // 2, 2) + sample_shape).mean(
+                axis=(1, 3), dtype=np.float32)
+            out[y0 - y:y1 - y, x0 - x:x1 - x] = (small + 0.5).astype(np.uint8)
+            return out
+        ts = self.tile_size
+        for row in range(y0 // ts, (y1 - 1) // ts + 1):
+            ty = row * ts
+            sy0, sy1 = max(y0, ty), min(y1, ty + ts)
+            for col in range(x0 // ts, (x1 - 1) // ts + 1):
+                tx = col * ts
+                sx0, sx1 = max(x0, tx), min(x1, tx + ts)
+                tile = tile_fn(level, col, row)
+                out[sy0 - y:sy1 - y, sx0 - x:sx1 - x] = tile[sy0 - ty:sy1 - ty, sx0 - tx:sx1 - tx]
+        return out
+
+
+class KFBioSlide(_SlideBase):
+    """Reader for KFBio fluorescent ``.kfbf`` slides.
+
+    Parameters
+    ----------
+    path : path to the .kfbf file
+    mpp_fallback : pixel size (µm/px) used when the header value is invalid
+    channel_names : optional override of the channel labels
+    tile_cache : number of decoded 256x256 tiles kept in an LRU cache
+    """
+
+    kind = "fluorescence"
+    min_file_size = 0x60
+
+    def __init__(self, path: str | os.PathLike, mpp_fallback: float = DEFAULT_MPP,
+                 channel_names: Sequence[str] | None = None, tile_cache: int = 1024):
+        super().__init__(path, tile_cache)
+        try:
+            self._parse_header(mpp_fallback)
+            self._parse_metadata()
+            self._parse_index()
+            self._resolve_channels(channel_names)
+            self._build_levels()
+        except Exception:
+            self.close()
+            raise
 
     # ---- parsing ---------------------------------------------------------
     def _parse_header(self, mpp_fallback: float) -> None:
@@ -454,29 +649,7 @@ class KFBioSlide:
 
         self.n_source_levels = len(levels)
         # Synthesize a pyramid if the file contains only high-resolution levels
-        while max(levels[-1].width, levels[-1].height) > MIN_PYRAMID_DIM:
-            p = levels[-1]
-            levels.append(Level(len(levels), p.scale / 2, max(1, math.ceil(p.width / 2)),
-                                max(1, math.ceil(p.height / 2)), 0, 0,
-                                p.downsample * 2, synthetic=True))
-        self.levels = levels
-
-    # ---- properties ------------------------------------------------------
-    @property
-    def n_levels(self) -> int:
-        return len(self.levels)
-
-    @property
-    def n_z(self) -> int:
-        return len(self.z_values)
-
-    @property
-    def dimensions(self) -> tuple[int, int]:
-        """(width, height) of level 0."""
-        return self.levels[0].width, self.levels[0].height
-
-    def level_mpp(self, level: int) -> float:
-        return self.mpp * self.levels[level].downsample
+        self.levels = self._add_synthetic_levels(levels)
 
     def summary(self, min_level_size: int = 256, max_levels: int | None = None) -> str:
         lines = [
@@ -533,11 +706,9 @@ class KFBioSlide:
             raise IndexError(f"level {level} is not a source level "
                              f"(0..{self.n_source_levels - 1}); use read_region()")
         key = (level, z, col, row, channel)
-        with self._lock:
-            hit = self._cache.get(key)
-            if hit is not None:
-                self._cache.move_to_end(key)
-                return hit
+        hit = self._cache_get(key)
+        if hit is not None:
+            return hit
         ri = self._lookup.get((level, z, col, row))
         tile = np.zeros((SRC_TILE, SRC_TILE), np.uint8)
         if ri is not None:
@@ -548,19 +719,9 @@ class KFBioSlide:
                     h, w = min(arr.shape[0], SRC_TILE), min(arr.shape[1], SRC_TILE)
                     tile[:h, :w] = arr[:h, :w]
                 except Exception as exc:
-                    with self._lock:
-                        self.decode_failures += 1
-                        first = self.decode_failures == 1
-                    if first:
-                        log.warning("%s: tile decode failed (L%d c%d r%d ch%d): %s",
-                                    self.path.name, level, col, row, channel, exc)
-        tile.flags.writeable = False
-        if self._cache_size:
-            with self._lock:
-                self._cache[key] = tile
-                if len(self._cache) > self._cache_size:
-                    self._cache.popitem(last=False)
-        return tile
+                    self._note_decode_failure(
+                        f"L{level} c{col} r{row} ch{channel}", exc)
+        return self._cache_put(key, tile)
 
     def read_region(self, level: int, x: int, y: int, width: int, height: int,
                     channel: int, z: int = 0) -> np.ndarray:
@@ -568,31 +729,8 @@ class KFBioSlide:
 
         Pixels outside the level bounds are zero.
         """
-        lv = self.levels[level]
-        out = np.zeros((height, width), np.uint8)
-        x0, y0 = max(x, 0), max(y, 0)
-        x1, y1 = min(x + width, lv.width), min(y + height, lv.height)
-        if x1 <= x0 or y1 <= y0:
-            return out
-        if lv.synthetic:
-            pw, ph = 2 * (x1 - x0), 2 * (y1 - y0)
-            parent = self.levels[level - 1]
-            src = self.read_region(level - 1, 2 * x0, 2 * y0, pw, ph, channel, z)
-            vw, vh = min(pw, parent.width - 2 * x0), min(ph, parent.height - 2 * y0)
-            if vw < pw or vh < ph:  # replicate edge instead of averaging with zeros
-                src = np.pad(src[:vh, :vw], ((0, ph - vh), (0, pw - vw)), mode="edge")
-            small = src.reshape(ph // 2, 2, pw // 2, 2).mean(axis=(1, 3), dtype=np.float32)
-            out[y0 - y:y1 - y, x0 - x:x1 - x] = (small + 0.5).astype(np.uint8)
-            return out
-        for row in range(y0 // SRC_TILE, (y1 - 1) // SRC_TILE + 1):
-            ty = row * SRC_TILE
-            sy0, sy1 = max(y0, ty), min(y1, ty + SRC_TILE)
-            for col in range(x0 // SRC_TILE, (x1 - 1) // SRC_TILE + 1):
-                tx = col * SRC_TILE
-                sx0, sx1 = max(x0, tx), min(x1, tx + SRC_TILE)
-                tile = self.get_tile(level, col, row, channel, z)
-                out[sy0 - y:sy1 - y, sx0 - x:sx1 - x] = tile[sy0 - ty:sy1 - ty, sx0 - tx:sx1 - tx]
-        return out
+        return self._read_plane(level, x, y, width, height,
+                                lambda lv, col, row: self.get_tile(lv, col, row, channel, z))
 
     def read_region_channels(self, level: int, x: int, y: int, width: int, height: int,
                              z: int = 0) -> np.ndarray:
@@ -618,6 +756,372 @@ class KFBioSlide:
                         hist[c] += np.bincount(
                             self.read_region(level, x, y, w, h, c, z).ravel(), minlength=256)
         return hist
+
+
+TIFF_MAGICS = (b"II*\0", b"MM\0*", b"II+\0", b"MM\0+")
+_TIFF_JPEG, _PHOTOMETRIC_RGB, _PHOTOMETRIC_YCBCR = 7, 2, 6
+
+
+def _parse_aperio_description(desc: str) -> dict[str, str]:
+    """``'Aperio ... |AppMag = 20|MPP = 0.4859|...'`` -> {'AppMag': '20', ...}."""
+    props: dict[str, str] = {}
+    for part in desc.split("|")[1:]:
+        key, sep, value = part.partition("=")
+        if sep and key.strip():
+            props[key.strip()] = value.strip()
+    return props
+
+
+def _float_or_none(text) -> float | None:
+    try:
+        v = float(text)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+@dataclass
+class _SVSLevelInfo:
+    """Where one SVS pyramid level's tiles live and how they are encoded."""
+
+    page: object            # tifffile.TiffPage
+    offsets: np.ndarray     # int64, row-major tile order
+    counts: np.ndarray      # int64, 0 = missing tile
+    compression: int
+    photometric: int
+    jpegtables: bytes | None
+    rgb_stored: bool        # JPEG samples stored as RGB (no YCbCr transform)
+    stride: int             # tiles per row in the stored page
+    stored_size: tuple = ()  # (width, height) of the stored page
+
+
+class SVSSlide(_SlideBase):
+    """Reader for brightfield Aperio ``.svs`` slides (as written by KFBio).
+
+    Same interface as :class:`KFBioSlide`, but tiles and regions are RGB:
+    ``get_tile`` returns ``(tile_size, tile_size, 3)`` and ``read_region``
+    ``(height, width, 3)`` uint8. Missing tiles and pixels outside the image
+    are white (255), the colour of blank glass. Only the pyramid is read; the
+    thumbnail, label and macro images are ignored.
+
+    Parameters
+    ----------
+    path : path to the .svs file
+    mpp_fallback : pixel size (µm/px) used when the file does not state one
+    tile_cache : number of decoded tiles kept in an LRU cache
+    """
+
+    kind = "brightfield"
+    is_rgb = True
+    fill_value = 255
+    n_channels = 3
+    channel_names = ["Red", "Green", "Blue"]
+    channel_colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+
+    def __init__(self, path: str | os.PathLike, mpp_fallback: float = DEFAULT_MPP,
+                 tile_cache: int = 1024):
+        super().__init__(path, tile_cache)
+        self._tif = None
+        try:
+            if bytes(self._mm[:4]) not in TIFF_MAGICS:
+                raise SlideFormatError("not a TIFF/SVS file (bad magic)")
+            self._tif = tifffile.TiffFile(self.path)
+            self._parse(mpp_fallback)
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        tif = getattr(self, "_tif", None)
+        if tif is not None:
+            tif.close()
+            self._tif = None
+        super().close()
+
+    # ---- parsing ---------------------------------------------------------
+    def _parse(self, mpp_fallback: float) -> None:
+        tif = self._tif
+        self.is_bigtiff = tif.is_bigtiff
+        self.is_aperio = tif.is_svs
+        series = tif.series[0]
+        base = series.levels[0].keyframe
+        self.description = base.description or ""
+        self.properties = (_parse_aperio_description(self.description)
+                           if self.is_aperio else {})
+        self.width, self.height = int(base.imagewidth), int(base.imagelength)
+        self.codec = getattr(base.compression, "name", str(base.compression))
+        mag = _float_or_none(self.properties.get("AppMag"))
+        self.magnification = int(round(mag)) if mag else 0
+
+        # Pixel size: Aperio "MPP =", else TIFF resolution tags, else fallback
+        mpp = _float_or_none(self.properties.get("MPP"))
+        self.mpp_source = "description"
+        if mpp is None or not 0.01 <= mpp <= 100:
+            mpp, self.mpp_source = self._mpp_from_resolution(base), "resolution tags"
+        if mpp is None or not 0.01 <= mpp <= 100:
+            mpp, self.mpp_source = float(mpp_fallback), "fallback"
+            self._warn(f"no pixel size in file; using {mpp_fallback} um/px (set --mpp)")
+        self.mpp = float(f"{mpp:.6g}")
+        self.mpp_from_header = self.mpp_source != "fallback"
+
+        if base.dtype != np.uint8 or base.samplesperpixel not in (3, 4):
+            raise SlideFormatError(
+                f"unsupported SVS pixel format ({base.samplesperpixel} samples of "
+                f"{base.dtype}); only 8-bit RGB brightfield is supported")
+        if not base.is_tiled:
+            raise SlideFormatError("SVS level 0 is not tiled")
+        if base.tilewidth != base.tilelength:
+            raise SlideFormatError(f"non-square tiles ({base.tilewidth}x{base.tilelength})")
+        if int(base.planarconfig) != 1:
+            raise SlideFormatError("only contiguous (chunky) RGB SVS files are supported")
+        self.tile_size = int(base.tilewidth)
+
+        levels: list[Level] = []
+        self._info: list[_SVSLevelInfo] = []
+        bad = 0
+        for lvs in series.levels:
+            pg = lvs.keyframe
+            if len(lvs.pages) > 1 and not levels:
+                self._warn(f"{len(lvs.pages)} planes per level; only the first is read")
+            w, h = int(pg.imagewidth), int(pg.imagelength)
+            if not pg.is_tiled or pg.tilewidth != self.tile_size \
+                    or pg.tilelength != self.tile_size or int(pg.planarconfig) != 1:
+                self._warn(f"level {w}x{h} has a different tile layout; "
+                           f"lower levels will be computed instead")
+                break
+            if levels and (w >= levels[-1].width or h >= levels[-1].height):
+                self._warn(f"skipping non-decreasing level {w}x{h}")
+                continue
+            stored = (w, h)
+            ds = (self.width / w + self.height / h) / 2
+            log2 = math.log2(ds)
+            if abs(log2 - round(log2)) < 0.15:  # Aperio pads level sizes
+                ds = float(2 ** round(log2))
+                if levels:
+                    # KFBio pads small levels (e.g. 1628x2305 stored as
+                    # 1632x2320, padding is white): declare the true size so
+                    # the pyramid steps are exact. Tiles are unchanged.
+                    r = ds / levels[-1].downsample
+                    if r == int(r):
+                        w = min(w, math.ceil(levels[-1].width / r))
+                        h = min(h, math.ceil(levels[-1].height / r))
+            stride = math.ceil(stored[0] / self.tile_size)
+            ncols, nrows = math.ceil(w / self.tile_size), math.ceil(h / self.tile_size)
+            offsets = np.asarray(pg.dataoffsets, np.int64)
+            counts = np.asarray(pg.databytecounts, np.int64)
+            need = stride * math.ceil(stored[1] / self.tile_size)
+            if len(offsets) < need or len(counts) != len(offsets):
+                raise SlideFormatError(f"level {stored[0]}x{stored[1]}: {len(offsets)} "
+                                       f"tiles, expected {need}")
+            outside = (offsets + counts > self.file_size) | (offsets < 0)
+            if outside.any():
+                bad += int(outside.sum())
+                counts = np.where(outside, 0, counts)
+            comp, phot = int(pg.compression), int(pg.photometric)
+            levels.append(Level(len(levels), (self.magnification or 1) / ds, w, h,
+                                ncols, nrows, ds, coord_mode="tiff"))
+            self._info.append(_SVSLevelInfo(
+                pg, offsets[:need], counts[:need], comp, phot, pg.jpegtables or None,
+                comp == _TIFF_JPEG and phot == _PHOTOMETRIC_RGB, stride, stored))
+        if bad:
+            self._warn(f"{bad} tile(s) point outside the file (truncated?); shown as white")
+        self.z_values = [0]
+        self.n_source_levels = len(levels)
+        self.levels = self._add_synthetic_levels(levels)
+        self.associated = [s.name for s in tif.series[1:]]
+
+    @staticmethod
+    def _mpp_from_resolution(page) -> float | None:
+        try:
+            xres = page.tags["XResolution"].value
+            unit = int(page.tags["ResolutionUnit"].value)
+        except (KeyError, TypeError, ValueError):
+            return None
+        ppu = xres[0] / xres[1] if isinstance(xres, tuple) else float(xres)
+        if not ppu or unit not in (2, 3):
+            return None
+        return (2.54e4 if unit == 2 else 1e4) / ppu  # inch / cm -> µm per pixel
+
+    # ---- info ------------------------------------------------------------
+    def missing_tiles(self) -> int:
+        return int(sum(np.count_nonzero(i.counts == 0) for i in self._info))
+
+    def stored_size(self, level: int) -> tuple[int, int]:
+        """(width, height) of the level as stored, including any padding."""
+        return self._info[level].stored_size
+
+    def summary(self, min_level_size: int = 256, max_levels: int | None = None) -> str:
+        info0 = self._info[0]
+        sub = self.jpeg_subsampling(0) if info0.compression == _TIFF_JPEG else None
+        scanner = (self.description.split("|", 1)[0].strip().splitlines() or ["-"])[0]             if self.is_aperio else "-"
+        lines = [
+            f"File          : {self.path}",
+            f"Type          : brightfield RGB ({'Aperio SVS' if self.is_aperio else 'TIFF'}, "
+            f"{'BigTIFF' if self.is_bigtiff else 'classic TIFF'})",
+            f"Scanner       : {scanner}",
+            f"Dimensions    : {self.width} x {self.height} px  @ {self.magnification}x",
+            f"MPP           : {self.mpp:.5g} um/px"
+            + ("" if self.mpp_source == "description" else f" ({self.mpp_source})"),
+            f"Tiles         : {self.tile_size}x{self.tile_size} {self.codec}, photometric "
+            f"{'RGB' if info0.photometric == _PHOTOMETRIC_RGB else 'YCbCr'}"
+            + (f", subsampling {sub[0]}x{sub[1]}" if sub else "")
+            + f", {self.missing_tiles()} missing",
+            f"Associated    : {', '.join(self.associated) or '-'} (not exported)",
+        ]
+        exported = {lv.index for lv in select_export_levels(self.levels, min_level_size,
+                                                             max_levels)}
+        lines.append(f"Levels ('*' = exported, min size {min_level_size}px):")
+        for lv in self.levels:
+            lines.append(
+                f" {'*' if lv.index in exported else ' '}[{lv.index:2d}] "
+                f"{lv.width:>7d} x {lv.height:<7d} ds {lv.downsample:<8g}"
+                + (" (synthetic)" if lv.synthetic else f" grid {lv.grid_cols}x{lv.grid_rows}"
+                   + ("" if self.stored_size(lv.index) == (lv.width, lv.height) else
+                      " (stored %dx%d, padding cropped)" % self.stored_size(lv.index))))
+        return "\n".join(lines)
+
+    # ---- pixel access ----------------------------------------------------
+    def _decode(self, info: _SVSLevelInfo, data: bytes, index: int) -> np.ndarray:
+        if info.compression == _TIFF_JPEG:
+            return decode_jpeg_rgb(data, info.jpegtables, info.rgb_stored)
+        seg = info.page.decode(data, index, jpegtables=info.jpegtables)[0]
+        return np.asarray(seg).reshape(self.tile_size, self.tile_size, -1)
+
+    def raw_tile(self, level: int, col: int, row: int) -> bytes | None:
+        """The stored (still encoded) bytes of one source tile, or None if missing."""
+        info, lv = self._info[level], self.levels[level]
+        if not (0 <= col < lv.grid_cols and 0 <= row < lv.grid_rows):
+            return None
+        i = row * info.stride + col
+        off, cnt = int(info.offsets[i]), int(info.counts[i])
+        return self._mm[off:off + cnt] if cnt > 0 else None
+
+    def get_tile(self, level: int, col: int, row: int, z: int = 0) -> np.ndarray:
+        """Return one decoded (tile_size, tile_size, 3) uint8 RGB source tile.
+
+        Missing / out-of-range tiles are white (255).
+        """
+        if not 0 <= level < self.n_source_levels:
+            raise IndexError(f"level {level} is not a source level "
+                             f"(0..{self.n_source_levels - 1}); use read_region()")
+        key = (level, z, col, row)
+        hit = self._cache_get(key)
+        if hit is not None:
+            return hit
+        ts = self.tile_size
+        tile = np.full((ts, ts, 3), 255, np.uint8)
+        data = self.raw_tile(level, col, row)
+        if data is not None:
+            try:
+                arr = self._decode(self._info[level], data,
+                                   row * self._info[level].stride + col)
+                h, w = min(arr.shape[0], ts), min(arr.shape[1], ts)
+                tile[:h, :w] = arr[:h, :w, :3]
+            except Exception as exc:
+                self._note_decode_failure(f"L{level} c{col} r{row}", exc)
+        return self._cache_put(key, tile)
+
+    def read_region(self, level: int, x: int, y: int, width: int, height: int,
+                    z: int = 0) -> np.ndarray:
+        """Read a (height, width, 3) uint8 RGB region at ``level``.
+
+        Pixels outside the level bounds are white.
+        """
+        return self._read_plane(level, x, y, width, height,
+                                lambda lv, col, row: self.get_tile(lv, col, row, z), (3,))
+
+    # ---- tile copy (lossless passthrough) ---------------------------------
+    def jpeg_subsampling(self, level: int) -> tuple[int, int] | None:
+        """(h, v) luma sampling factors read from the level's JPEG SOF header."""
+        lv, found = self.levels[level], None
+        n = lv.grid_cols * lv.grid_rows
+        for i in sorted({0, n // 2, n - 1}):
+            data = self.raw_tile(level, i % lv.grid_cols, i // lv.grid_cols)
+            sof = jpeg_sof_info(bytes(data[:4096])) if data is not None else None
+            if sof is None or len(sof.get("components", ())) != 3:
+                continue
+            (_, h, v), *chroma = sof["components"]
+            if any((ch, cv) != (1, 1) for _, ch, cv in chroma):
+                return None
+            if found not in (None, (h, v)):
+                return None
+            found = (h, v)
+        return found
+
+    def copy_tiles_plan(self, levels: Sequence[Level]) -> tuple[dict | None, str]:
+        """Can ``levels`` be written by copying the stored JPEG tiles as-is?
+
+        Returns ``({level_index: tifffile kwargs}, "")`` or ``(None, reason)``.
+        """
+        plan: dict[int, dict] = {}
+        for lv in levels:
+            if lv.synthetic:
+                return None, f"level {lv.index} is computed, not stored"
+            info = self._info[lv.index]
+            if info.compression != _TIFF_JPEG:
+                return None, f"source tiles are {self.codec}, not JPEG"
+            if info.photometric != _PHOTOMETRIC_YCBCR:
+                return None, "source JPEG tiles are not YCbCr"
+            sub = self.jpeg_subsampling(lv.index)
+            if sub is None:
+                return None, f"could not determine JPEG subsampling of level {lv.index}"
+            plan[lv.index] = {"subsampling": sub, "jpegtables": info.jpegtables}
+        return plan, ""
+
+    def blank_jpeg(self, subsampling: tuple[int, int]) -> bytes:
+        """A white JPEG tile matching the source's tile size and subsampling."""
+        key = ("blank", subsampling)
+        with self._lock:
+            hit = self._cache.get(key)
+        if hit is None:
+            hit = imagecodecs.jpeg_encode(
+                np.full((self.tile_size, self.tile_size, 3), 255, np.uint8),
+                level=90, subsampling=subsampling)
+            with self._lock:
+                self._cache[key] = hit  # tiny; LRU eviction is harmless
+        return hit
+
+
+SLIDE_SUFFIXES = {".kfbf": "fluorescence", ".svs": "brightfield"}
+
+
+def detect_slide_type(path: str | os.PathLike) -> str | None:
+    """'fluorescence' / 'brightfield' from the file's magic bytes, else None."""
+    with open(path, "rb") as fh:
+        head = fh.read(8)
+    if head[:4] == MAGIC and head[4:8] == SIGNATURE:
+        return "fluorescence"
+    if head[:4] in TIFF_MAGICS:
+        return "brightfield"
+    return None
+
+
+def open_slide(path: str | os.PathLike, **kw) -> KFBioSlide | SVSSlide:
+    """Open a slide with the right reader: magic bytes first, extension second.
+
+    Keyword arguments (``mpp_fallback``, ``channel_names``, ``tile_cache``)
+    are passed to the reader; ``channel_names`` is ignored for brightfield.
+    """
+    path = Path(path)
+    by_magic = detect_slide_type(path)
+    by_ext = SLIDE_SUFFIXES.get(path.suffix.lower())
+    if by_magic == "brightfield" and by_ext != "brightfield":
+        with tifffile.TiffFile(path) as t:
+            if not t.is_svs:  # e.g. an already-converted .tif: never re-read it
+                raise SlideFormatError(
+                    f"{path.name}: TIFF file is not an Aperio .svs slide")
+    kind = by_magic or by_ext
+    if kind is None:
+        raise SlideFormatError(
+            f"{path.name}: unrecognised slide file; expected a KFBio fluorescence "
+            f"slide (.kfbf) or an Aperio brightfield slide (.svs)")
+    if by_magic and by_ext and by_magic != by_ext:
+        log.warning("%s: extension says %s but the file content is a %s slide; "
+                    "reading it as %s", path.name, by_ext, by_magic, by_magic)
+    if kind == "fluorescence":
+        return KFBioSlide(path, **{k: v for k, v in kw.items()
+                                   if k in ("mpp_fallback", "channel_names", "tile_cache")})
+    return SVSSlide(path, **{k: v for k, v in kw.items() if k in ("mpp_fallback", "tile_cache")})
 
 
 # --------------------------------------------------------------------------
@@ -686,7 +1190,7 @@ def _composite_luts(limits, colors) -> np.ndarray:
 class _PyramidWriter:
     """Shared machinery: writes one pyramidal BigTIFF from a tile function."""
 
-    def __init__(self, slide: KFBioSlide, tile_size: int, compression: str,
+    def __init__(self, slide: "_SlideBase", tile_size: int, compression: str,
                  workers: int, jpeg_quality: int = 90, show_progress: bool = True,
                  levels: Sequence[Level] | None = None):
         if tile_size % 16 or tile_size < 16:
@@ -714,9 +1218,17 @@ class _PyramidWriter:
     def write(self, out_path: Path, *, planes: Sequence, lead_shape: tuple,
               sample_shape: tuple,
               fetch: Callable[[int, object, int, int], np.ndarray],
-              photometric: str, metadata: dict | None, ome: bool, desc: str) -> Path:
-        """fetch(level, plane, tx, ty) -> tile array (ts, ts, *sample_shape)."""
-        slide, ts = self.slide, self.ts
+              photometric: str, metadata: dict | None, ome: bool, desc: str,
+              tile_size: int | None = None,
+              encoded: Callable[[Level], dict] | None = None) -> Path:
+        """fetch(level, plane, tx, ty) -> tile array (ts, ts, *sample_shape).
+
+        With ``encoded``, fetch returns already-compressed JPEG tile bytes
+        instead, and ``encoded(level)`` gives the matching tifffile kwargs
+        (``subsampling``, ``jpegtables``); ``tile_size`` overrides the
+        writer's tile size (it must equal the source tile size then).
+        """
+        slide, ts = self.slide, tile_size or self.ts
         levels = self.levels
         lead = tuple(d for d in lead_shape if d > 1)
         assert math.prod(lead) == len(planes), (lead, len(planes))
@@ -736,8 +1248,10 @@ class _PyramidWriter:
                     def make(job, _lv=lv.index):
                         p, tx, ty = job
                         tile = fetch(_lv, p, tx, ty)
+                        if encoded is not None:
+                            return tile
                         if tile.shape != tile_shape:  # pad edge tiles
-                            padded = np.zeros(tile_shape, np.uint8)
+                            padded = np.full(tile_shape, slide.fill_value, np.uint8)
                             padded[:tile.shape[0], :tile.shape[1]] = tile
                             tile = padded
                         return tile
@@ -752,7 +1266,8 @@ class _PyramidWriter:
                         shape=lead + (lv.height, lv.width) + sample_shape,
                         dtype=np.uint8, tile=(ts, ts), photometric=photometric,
                         resolution=(res, res), resolutionunit="CENTIMETER",
-                        **self._compression_kwargs(photometric == "rgb"),
+                        **(dict(compression="jpeg", **encoded(lv)) if encoded is not None
+                           else self._compression_kwargs(photometric == "rgb")),
                     )
                     if photometric == "rgb":
                         kw["planarconfig"] = "contig"
@@ -767,7 +1282,9 @@ class _PyramidWriter:
                     # in parallel (default 512 MB); bound it to keep RAM flat.
                     # Older tifffile lacks `buffersize`: compress serially there,
                     # which streams tile-by-tile without read-ahead.
-                    if _WRITE_HAS_BUFFERSIZE:
+                    if encoded is not None:
+                        kw.update(maxworkers=1)  # nothing to compress
+                    elif _WRITE_HAS_BUFFERSIZE:
                         kw.update(maxworkers=self.workers, buffersize=WRITE_BUFFER_BYTES)
                     else:
                         kw.update(maxworkers=1)
@@ -784,7 +1301,7 @@ class _PyramidWriter:
         return out_path
 
 
-def _region(slide: KFBioSlide, level: int, tx: int, ty: int, ts: int) -> tuple[int, int, int, int]:
+def _region(slide: "_SlideBase", level: int, tx: int, ty: int, ts: int) -> tuple[int, int, int, int]:
     lv = slide.levels[level]
     x, y = tx * ts, ty * ts
     return x, y, min(ts, lv.width - x), min(ts, lv.height - y)
@@ -874,6 +1391,39 @@ def write_split(slide: KFBioSlide, out_path: Path, channel: int,
                         sample_shape=(),
                         fetch=fetch, photometric="minisblack", metadata=metadata,
                         ome=False, desc=f"{slide.channel_names[channel]:<5.5s} {slide.path.stem}")
+
+
+def write_brightfield(slide: SVSSlide, out_path: Path, writer: _PyramidWriter,
+                      copy_tiles: bool = False) -> Path:
+    """RGB pyramidal BigTIFF for a brightfield slide (photometric RGB,
+    contiguous samples, resolution in pixels/cm, pyramid in SubIFDs).
+
+    With ``copy_tiles`` the stored JPEG tiles are copied unchanged (no
+    re-compression, so no extra quality loss); this requires JPEG/YCbCr
+    source tiles and only stored (non-synthetic) levels, else SlideFormatError.
+    """
+    planes = list(range(slide.n_z))
+    desc = f"BF   {slide.path.stem}"
+    if copy_tiles:
+        plan, why = slide.copy_tiles_plan(writer.levels)
+        if plan is None:
+            raise SlideFormatError(f"cannot copy source tiles: {why}")
+
+        def fetch_raw(level, z, tx, ty):
+            data = slide.raw_tile(level, tx, ty)
+            return bytes(data) if data is not None else                 slide.blank_jpeg(plan[level]["subsampling"])
+
+        return writer.write(out_path, planes=planes, lead_shape=(slide.n_z,),
+                            sample_shape=(3,), fetch=fetch_raw, photometric="rgb",
+                            metadata=None, ome=False, desc=desc,
+                            tile_size=slide.tile_size, encoded=lambda lv: plan[lv.index])
+
+    def fetch(level, z, tx, ty):
+        x, y, w, h = _region(slide, level, tx, ty, writer.ts)
+        return slide.read_region(level, x, y, w, h, z)
+
+    return writer.write(out_path, planes=planes, lead_shape=(slide.n_z,), sample_shape=(3,),
+                        fetch=fetch, photometric="rgb", metadata=None, ome=False, desc=desc)
 
 
 # --------------------------------------------------------------------------
