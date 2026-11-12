@@ -23,3 +23,6 @@ build/
 *.tif
 *.tiff
 output/
+
+# Test cache
+.pytest_cache/

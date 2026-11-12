@@ -240,12 +240,13 @@ def decode_jpeg_rgb(data: bytes, tables: bytes | None = None,
         if Image is None:
             raise KFBFError("neither imagecodecs nor Pillow could decode JPEG")
         with Image.open(io.BytesIO(_merge_jpeg_tables(tables, data))) as im:
-            im.load()
             if rgb_stored and im.mode == "RGB":
-                # libjpeg treated the raw RGB samples as YCbCr and converted
-                # them; undoing that conversion recovers the stored values.
-                im = im.convert("YCbCr")
-            elif im.mode != "RGB":
+                # Without an Adobe marker libjpeg would treat the stored RGB
+                # samples as YCbCr and convert them; asking for "YCbCr"
+                # output returns the stored component values unchanged.
+                im.draft("YCbCr", None)
+            im.load()
+            if im.mode != "RGB" and not (rgb_stored and im.mode == "YCbCr"):
                 im = im.convert("RGB")
             arr = np.asarray(im)
     if arr.ndim == 2:
@@ -1649,8 +1650,13 @@ def preflight_check(est: SizeEstimate, out_path: Path, bigtiff: bool = True,
     """
     name = out_path.name
     warnings: list[str] = []
-    jpeg_hint = (f", or use --compression jpeg (about {_gb(jpeg_estimate)})"
-                 if jpeg_estimate is not None and jpeg_estimate < est.estimate else "")
+
+    def jpeg_hint(limit: int) -> str:
+        """Suggest --compression jpeg only if it would bring the file under ``limit``."""
+        if jpeg_estimate is not None and jpeg_estimate < est.estimate \
+                and jpeg_estimate <= limit:
+            return f", or use --compression jpeg (about {_gb(jpeg_estimate)})"
+        return ""
 
     # --- TIFF format limits ---------------------------------------------
     if est.max_dim > TIFF_MAX_DIM:
@@ -1663,7 +1669,7 @@ def preflight_check(est: SizeEstimate, out_path: Path, bigtiff: bool = True,
             raise DataTooBigError(
                 f"{name}: needs about {_gb(est.estimate)}, but classic TIFF files "
                 f"are limited to {_gb(CLASSIC_TIFF_MAX_BYTES + 1)}.",
-                "write BigTIFF" + jpeg_hint + ".")
+                "write BigTIFF" + jpeg_hint(CLASSIC_TIFF_MAX_BYTES) + ".")
         if est.tiles_per_ifd > 2 ** 32 - 1:
             raise DataTooBigError(
                 f"{name}: {est.tiles_per_ifd} tiles in one image exceed the classic "
@@ -1687,7 +1693,7 @@ def preflight_check(est: SizeEstimate, out_path: Path, bigtiff: bool = True,
                 f"{name}: would be about {_gb(est.estimate)}, but the output drive "
                 f"{volume} is {fstype}, which cannot store files larger than "
                 f"{_gb(FAT_MAX_FILE_BYTES + 1)}.",
-                "choose an NTFS or exFAT drive with -o" + jpeg_hint + ".")
+                "choose an NTFS or exFAT drive with -o" + jpeg_hint(FAT_MAX_FILE_BYTES) + ".")
         if not est.exact and est.uncompressed > FAT_MAX_FILE_BYTES:
             warnings.append(
                 f"{name}: the output drive {volume} is {fstype} (max 4 GB per file). "
@@ -1708,7 +1714,7 @@ def preflight_check(est: SizeEstimate, out_path: Path, bigtiff: bool = True,
                 f"{name}: needs about {_gb(est.estimate)} (plus a {_gb(margin)} safety "
                 f"margin), but only {_gb(free)} is free on {volume}.",
                 f"free up {_gb(need)} on {volume}, or choose another drive with -o"
-                + jpeg_hint + ".")
+                + jpeg_hint(free - free_space_margin(jpeg_estimate or 0)) + ".")
     return warnings
 
 
@@ -2107,6 +2113,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handler = _TqdmHandler()
     handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    for old in [h for h in log.handlers if isinstance(h, _TqdmHandler)]:
+        log.removeHandler(old)  # main() may be called repeatedly in-process
     log.addHandler(handler)
     log.setLevel(logging.DEBUG if args.verbose else logging.INFO)
     log.propagate = False
