@@ -1,11 +1,27 @@
-# kfbf-converter — Pure-Python KFBio Fluorescent Slide Converter
+# kfbf-converter — Pure-Python KFBio Slide Converter
 
 ## Overview
 
 **kfbf-converter** is a fast, low-memory converter for computational pathology. It
-turns proprietary **KFBio `.kfbf` fluorescent whole-slide images** into QuPath-ready
-multi-channel **OME-TIFFs** and standard **BigTIFFs**. QuPath, Bio-Formats, napari,
-OMERO and most other image-analysis tools can open the results.
+turns **KFBio whole-slide scans** into QuPath-ready open formats:
+
+- **fluorescence** scans (`.kfbf`, proprietary) into multi-channel **OME-TIFFs**
+  and standard **BigTIFFs**
+- **brightfield** scans (`.svs`, as written by KFBio scanners) into an
+  **RGB pyramidal BigTIFF** with standard pixel-size tags
+
+QuPath, Bio-Formats, napari, OMERO and most other image-analysis tools can open
+the results.
+
+### Supported inputs
+
+| Scan | Input file | Outputs |
+|---|---|---|
+| Fluorescence | `.kfbf` | OME-TIFF (default), composite RGB BigTIFF, split grayscale BigTIFFs |
+| Brightfield | `.svs` | RGB pyramidal BigTIFF (`<name>.tif`) |
+
+The scanner also writes QPTIFF for fluorescence itself, so that is not offered here.
+Older KFBio `.kfb` files are not supported.
 
 ## Key Features
 
@@ -18,13 +34,24 @@ OMERO and most other image-analysis tools can open the results.
   visible next to bright DAPI.
 - **Split grayscale BigTIFFs** (`_<channel>.tif`): one file per channel,
   e.g. `slide_DAPI.tif`.
+- **Brightfield RGB BigTIFF** (`.tif`) from `.svs`: the scanner's JPEG tiles are
+  copied unchanged, so there is **no extra quality loss** and the file is about
+  the size of the original (e.g. 94 MB `.svs` → 91 MB `.tif` in under a second).
+- **Clear size errors**: before writing, every output is checked against the
+  file format, the destination drive (e.g. FAT32's 4 GB file limit) and the
+  free space. If it can't fit, you get
+  *"Data is too big for the file format chosen."* with the reason and a fix,
+  never a corrupt file. Every finished file is also read back and checked
+  before it gets its final name.
 - **Pure Python**: no C++/Rust compiler, vendor SDK or DLLs needed. All
   dependencies install from pip.
 - **Low RAM use**: whole slides are processed tile by tile, so a full-resolution
   image never has to fit in memory. A 20 000 × 12 000 px, 3-channel slide converts
-  to every format using about 250 MB of RAM.
+  to every format using about 300 MB of RAM, a 44 000 × 47 000 px one to
+  OME-TIFF using about 370 MB.
 - **Batch mode and interactive menu**: point it at a folder to convert every
-  slide, or just run it and pick a format.
+  slide (fluorescence and brightfield can be mixed), or just run it and pick a
+  format.
 
 Every output is a tiled, pyramidal file. It holds the full resolution plus
 downsampled levels, so it opens and zooms instantly in QuPath.
@@ -40,8 +67,8 @@ downsampled levels, so it opens and zooms instantly in QuPath.
    pip install -r requirements.txt
    ```
 3. **Copy both `kfbf_converter.py` and `run_converter.bat`** into the folder
-   that contains your `.kfbf` files. The launcher looks for the script next to
-   itself, so the two files must stay together.
+   that contains your `.kfbf` and/or `.svs` files. The launcher looks for the
+   script next to itself, so the two files must stay together.
 4. **Double-click `run_converter.bat`** (or run `python kfbf_converter.py` in
    that folder). You will see:
    ```text
@@ -53,10 +80,19 @@ downsampled levels, so it opens and zooms instantly in QuPath.
      [4] All of the above
    Enter choice [1-4] (Press Enter for 1):
    ```
+   If the folder also has brightfield slides, the first line shows both counts,
+   e.g. `Found 3 fluorescence (.kfbf) and 2 brightfield (.svs) slide(s).` The
+   format you pick applies to the fluorescence slides; brightfield slides always
+   become an RGB BigTIFF. A folder with only brightfield slides skips the menu
+   and just asks you to press Enter to start.
 5. **Press Enter** to choose the default QuPath OME-TIFF mode.
 
 The converted files appear next to your slides. Existing outputs are skipped,
 so running it again only converts new slides.
+
+If a slide is too big for the drive you're saving to, you'll see
+`Data is too big for the file format chosen.` followed by what to do (see
+[Troubleshooting](#troubleshooting)). The other slides still convert.
 
 ---
 
@@ -65,9 +101,11 @@ so running it again only converts new slides.
 **Single file**
 ```bash
 python kfbf_converter.py slide.kfbf --mode ome
+python kfbf_converter.py slide.svs
 ```
 
-**Entire folder (batch)**
+**Entire folder (batch)**: `.kfbf` and `.svs` can be mixed; each slide gets
+the output that fits its type
 ```bash
 python kfbf_converter.py "C:\path\to\slides" --mode all -o "C:\path\to\output"
 ```
@@ -76,9 +114,10 @@ python kfbf_converter.py "C:\path\to\slides" --mode all -o "C:\path\to\output"
 converting it:
 ```bash
 python kfbf_converter.py slide.kfbf --info
+python kfbf_converter.py slide.svs --info
 ```
 
-### Output modes
+### Output modes (fluorescence `.kfbf`)
 
 | `--mode` | Creates | Best for |
 |---|---|---|
@@ -87,25 +126,92 @@ python kfbf_converter.py slide.kfbf --info
 | `split` | `slide_DAPI.tif`, `slide_FITC.tif`, … | Tools that expect one channel per file |
 | `all` | All of the above | |
 
+### Brightfield output (`.svs`)
+
+Each `.svs` gives one file, `slide.tif`: a tiled, pyramidal RGB BigTIFF
+(photometric RGB, chunky samples, pyramid in SubIFDs) with the pixel size in
+standard TIFF resolution tags. `--mode` does not apply; if you pass one, a single
+info line says it was ignored for that slide.
+
+By default the scanner's original JPEG tiles are **copied unchanged**: no
+re-compression, no quality loss, about the same size as the `.svs`. The
+thumbnail, slide label and macro photo are **not** copied, so label text
+doesn't end up in the output. If you set `--compression` or `--tile-size`, the
+tiles are decoded and re-encoded instead. On the 94 MB KFBio sample this gave:
+
+| Command | Output size | Time | Pixels vs `.svs` |
+|---|---|---|---|
+| *(default: tile copy)* | 91 MB | < 1 s | identical |
+| `--compression jpeg` (quality 90) | 111 MB | 3 s | re-compressed (lossy again) |
+| `--compression deflate` | 697 MB | 8 s | identical |
+| `--compression lzw` | 853 MB | 5 s | identical |
+
+The scanner already saves brightfield tiles as JPEG (quality 30), so the default
+copy is both the smallest and the most faithful option.
+
 ### Common options
 
 | Option | Default | What it does |
 |---|---|---|
 | `-o, --output-dir` | next to the input | Where to save the converted files |
-| `--compression` | `deflate` | `deflate` or `lzw` (lossless), or `jpeg` (smaller, lossy) |
+| `--compression` | `deflate` (`.svs`: copy tiles) | `deflate` or `lzw` (lossless), or `jpeg` (smaller, lossy) |
 | `--overwrite` | off | Replace files that already exist |
 | `--recursive` | off | Also convert slides in sub-folders |
-| `--channel-names` | from slide | Rename the channels, e.g. `--channel-names DAPI CD3 CD8` |
-| `--mpp` | `0.2528` | Pixel size (µm/px), used only if the slide header lacks one |
-| `--tile-size` | `512` | Output tile size in pixels |
+| `--channel-names` | from slide | Rename the channels, e.g. `--channel-names DAPI CD3 CD8` (fluorescence only) |
+| `--mpp` | `0.2528` | Pixel size (µm/px), used only if the slide doesn't contain one |
+| `--tile-size` | `512` (`.svs` tile copy: `256`) | Output tile size in pixels |
 | `--min-level-size` | `256` | Smallest pyramid level to keep, in pixels |
+| `--no-preflight` | off | Skip the size check before writing (see below) |
 | `-q, --quiet` | off | Hide progress bars |
+| `-v, --verbose` | off | Debug output, including size estimates and error tracebacks |
 
 Run `python kfbf_converter.py --help` for the full list.
+
+### Size checks and file safety
+
+Before each output file is written, the converter estimates its size and
+checks:
+
+- **File format**: outputs are always BigTIFF, which has no practical size
+  limit (classic TIFF stops at 4 GB). Image width and height must fit TIFF's
+  32-bit size fields. JPEG's 65 535 px limit applies to each tile, and tiles
+  are at most a few thousand px, so JPEG compression is safe for any slide size.
+- **Destination drive**: FAT32 (and older FAT) drives, which many USB sticks
+  and SD cards use, can't hold files over 4 GB. Outputs expected to exceed
+  that are refused. If only the worst case (no compression at all) would exceed
+  it, you get a warning instead.
+- **Free space**: the estimate plus a safety margin (256 MB + 5 %) must fit
+  on the drive.
+
+If an output can't fit, it is skipped, the rest of the batch continues, and
+it counts as a failure in the final summary:
+
+```text
+Data is too big for the file format chosen.
+  slide.ome.tif: would be about 5.20 GB, but the output drive E:\ is FAT32, which cannot store files larger than 4.00 GB.
+  Fix: choose an NTFS or exFAT drive with -o, or use --compression jpeg (about 1.60 GB).
+```
+
+The same message, with the real cause, appears if the disk fills up or the
+drive refuses a large file **while** writing.
+
+Files are written to `<name>.part` first. When writing finishes, the file is
+re-opened and checked: page and pyramid level counts, the size of every level,
+tile data inside the file, and one decoded tile per level. Only then is it
+renamed. If anything goes wrong, the partial file is deleted, so you never
+get a `.tif` that can't be opened. Leftover `.part` files from a run that was
+killed (e.g. by closing the window) are removed the next time you convert
+that slide.
+
+The estimate is deliberately cautious. If it ever refuses a file you know
+will fit, `--no-preflight` turns the check off. Written files are still
+verified.
 
 ---
 
 ## QuPath Integration Guide
+
+**Fluorescence (`.ome.tif`)**
 
 1. **Drag and drop** the `.ome.tif` file into the QuPath window. If QuPath asks
    for an image type, choose **Fluorescence**.
@@ -113,6 +219,16 @@ Run `python kfbf_converter.py --help` for the full list.
    and set its display range.
 3. Channel names, colours and the pixel size (µm) are already set, so
    measurements and scale bars are calibrated from the start.
+
+**Brightfield (`.tif` from `.svs`)**
+
+1. **Drag and drop** the `.tif` into QuPath.
+2. Set the image type to **Brightfield (H&E)** if QuPath asks, or later under
+   **Image → Set image type**. QuPath can also guess it automatically
+   (*Preferences → Auto-estimate image type on opening*).
+3. In the **Image** tab, check that **Pixel width** and **Pixel height** match
+   the `MPP` shown by `--info` (e.g. 0.4859 µm), and that zooming out is smooth
+   (pyramid levels are loaded).
 
 ---
 
@@ -122,7 +238,10 @@ Run `python kfbf_converter.py --help` for the full list.
 |---|---|
 | `Python is not installed or not in PATH` | Reinstall Python and tick **Add Python to PATH** |
 | `No module named ...` | Run `pip install -r requirements.txt` |
-| `No .kfbf files found` | Put the slides in the same folder you run the converter from |
+| `No .kfbf or .svs files found` | Put the slides in the same folder you run the converter from |
+| `Data is too big for the file format chosen.` | Follow the **Fix:** line under it. Usually: save to an NTFS or exFAT drive with `-o` (FAT32 USB sticks can't hold files over 4 GB), free up disk space, or use `--compression jpeg` for a smaller file. If you're sure it fits, try `--no-preflight` |
+| `Output failed verification and was deleted: ...` | The written file didn't read back correctly and was removed. Check the drive (try another one with `-o`), then run again with `-v` and share the output |
+| `unrecognised slide file` | Only KFBio `.kfbf` (fluorescence) and Aperio `.svs` (brightfield) slides are supported; older `.kfb` files are not |
 | Wrong or generic channel names | Set them with `--channel-names` |
 | Image looks scrambled or wrong | Run `--info` on the slide and share the output |
 
@@ -130,6 +249,13 @@ Run `python kfbf_converter.py --help` for the full list.
 
 Python 3.10+ with `tifffile`, `imagecodecs`, `numpy`, `pillow` and `tqdm`
 (see `requirements.txt`).
+
+To run the tests (they generate small synthetic slides, so no slide data is
+needed):
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
 
 ---
 
@@ -231,7 +357,7 @@ treated as **white** (blank glass); the sample had none.
   trusts only the TIFF tags.
 - `Q=30` is the scanner's JPEG quality: the source is already lossy, which is why
   the converter copies the original tiles instead of re-encoding them (see
-  *Brightfield output* above).
+  *Brightfield output (`.svs`)* above).
 
 ### Python API
 
@@ -255,5 +381,57 @@ with KFBioSlide("slide.kfbf") as slide:
 # Convert from code; returns the list of files written
 written = convert_slide("slide.kfbf", "output/", mode="all", compression="deflate")
 ```
+
+**Brightfield and automatic reader choice**
+
+```python
+from kfbf_converter import open_slide, SVSSlide, convert_slide
+
+# open_slide picks the reader by magic bytes first, file extension second:
+# KFBioSlide for .kfbf, SVSSlide for .svs. Unknown files raise SlideFormatError.
+with open_slide("slide.svs") as slide:          # -> SVSSlide
+    print(slide.summary())                       # same text as --info
+    print(slide.kind, slide.is_rgb, slide.n_channels, slide.mpp)  # brightfield True 3 0.485896
+
+    # One decoded source tile -> (256, 256, 3) uint8 RGB (white if missing)
+    tile = slide.get_tile(level=0, col=10, row=4)
+
+    # Any region at any level -> (height, width, 3) uint8 RGB (white outside the image)
+    rgb = slide.read_region(level=2, x=0, y=0, width=1024, height=1024)
+
+# Brightfield always writes <stem>.tif; mode is ignored. Leave compression and
+# tile_size unset to copy the original JPEG tiles, or set them to re-encode.
+convert_slide("slide.svs", "output/")
+convert_slide("slide.svs", "output/", compression="jpeg")
+```
+
+`convert_slide` also takes `preflight=True` (set it to `False` to skip the size
+check) and `errors=None`. By default a refused or unverifiable output raises
+`DataTooBigError` / `VerificationError`. If you pass a list, those failures are
+printed and appended as `(output_path, exception)`, and the remaining outputs
+are still written. `DataTooBigError.lines()` returns the three user-facing
+lines (headline, reason, fix).
+
+### How the size estimate works
+
+For every planned output:
+
+- **uncompressed** = sum over exported levels of
+  *tiles × tile_size² × samples × planes* (OME: planes = Z × channels; RGB and
+  brightfield: 3 samples).
+- **estimate** = uncompressed × compression factor, plus TIFF overhead
+  (16 bytes per tile for the BigTIFF offset/byte-count tables, about 1 KB per
+  IFD, and OME-XML). For a `.svs` tile copy, the estimate is the exact sum of
+  the copied tile bytes plus that overhead.
+- The factors were calibrated on real KFBio slides (worst compressed /
+  uncompressed ratios seen: deflate 0.26, lzw 0.30, jpeg q90 0.073), with about
+  1.5× headroom, because tissue-dense slides compress worse than those samples:
+  none 1.0, deflate 0.40, lzw 0.45, jpeg 0.12 (rising towards 0.35 at quality
+  100).
+
+The free-space margin is 256 MiB + 5 % of the estimate. The FAT limit is
+4 GiB − 1 per file. The file system is detected with `GetVolumeInformationW`
+on Windows and `/proc/self/mounts` on Linux; on macOS it isn't detected, but
+the free-space check still runs.
 
 </details>
