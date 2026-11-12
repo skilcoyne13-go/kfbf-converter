@@ -852,7 +852,7 @@ class SVSSlide(_SlideBase):
     ----------
     path : path to the .svs file
     mpp_fallback : pixel size (µm/px) used when the file does not state one
-    tile_cache : number of decoded tiles kept in an LRU cache
+    tile_cache : number of decoded RGB tiles kept in an LRU cache (default 256)
     """
 
     kind = "brightfield"
@@ -863,7 +863,8 @@ class SVSSlide(_SlideBase):
     channel_colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
 
     def __init__(self, path: str | os.PathLike, mpp_fallback: float = DEFAULT_MPP,
-                 tile_cache: int = 1024):
+                 tile_cache: int = 256):
+        # RGB tiles are 3x the size of fluorescence tiles: 256 x 192 KB = 48 MB
         super().__init__(path, tile_cache)
         self._tif = None
         try:
