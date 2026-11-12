@@ -180,6 +180,59 @@ in a sparse grid are treated as black. Pyramid levels are stored down to
 OME-XML channel colours are written as signed 32-bit **RGBA**, as the OME
 schema specifies. For example, blue (DAPI) is `65535` and red is `-16776961`.
 
+### The `.svs` brightfield format (as written by KFBio)
+
+KFBio scanners write brightfield scans as Aperio-style `.svs` files. SVS is a
+standard tiled TIFF, so nothing needed reverse engineering; the layout below
+was confirmed by inspecting a real KFBio `.svs` (26046 × 36880 px, 20×) with
+`tifffile`. Fields marked *unverified* were not present in that sample.
+
+**File header**
+
+| Offset | Type | Field |
+|---|---|---|
+| `0x00` | 4 bytes | `49 49 2A 00` (`II*\0`): little-endian **classic** TIFF. (`II+\0` = BigTIFF, also accepted) |
+| `0x04` | uint32 | Offset of the first IFD |
+
+**Pages (IFDs)**, in file order:
+
+| Page | Content | Size (sample) | Encoding |
+|---|---|---|---|
+| 0 | Level 0 (full resolution) | 26046 × 36880 | tiled 256 × 256, JPEG, YCbCr |
+| 1 | Thumbnail | 820 × 1164 | stripped, JPEG |
+| 2 – 7 | Levels 1 – 6, each exactly ½ the previous | 13023 × 18440 … 408 × 580 | tiled 256 × 256, JPEG, YCbCr |
+| 8 | Slide **label** (`subfiletype = 1`) | 1164 × 968 | LZW, RGB |
+| 9 | **Macro** overview (`subfiletype = 9`) | 2940 × 968 | JPEG |
+
+The converter reads only the pyramid (pages 0, 2–7; it uses `tifffile`'s
+`series[0].levels`). The thumbnail, label and macro are never exported, so
+label text (which may identify a patient) does not end up in the output.
+
+**Tiles**: each tile is a self-contained baseline JFIF JPEG (`SOF0`, 3
+components, **YCbCr 4:2:2**: luma sampling 2 × 1, chroma 1 × 1). There is
+no Adobe `APP14` marker and no shared `JPEGTables` tag (abbreviated tiles with
+`JPEGTables` are still supported, *unverified on KFBio files*). The TIFF
+`YCbCrSubSampling` tag is absent, although the JPEG streams are 4:2:2, so the
+converter reads the subsampling from each level's JPEG `SOF` header instead.
+Tiles stored with photometric RGB (the "Aperio RGB JPEG" variant) are decoded
+as RGB, not YCbCr (*unverified on KFBio files*). Zero-length tiles are
+treated as **white** (blank glass); the sample had none.
+
+**Metadata**: every page's `ImageDescription` reads like
+`Aperio Format Scanned By KFBIO | 26046x36879 [0,0 26046x36879] (256x256), JPEG/RGB Q=30|AppMag = 20|MPP = 0.485896|...`.
+
+- `MPP` is the **level-0** pixel size (µm/px) and is repeated unchanged on every
+  level; `AppMag` is the objective magnification.
+- There are **no** `XResolution` / `ResolutionUnit` tags, so readers that
+  don't parse Aperio descriptions don't know the pixel size. The converted
+  BigTIFF stores it in standard resolution tags.
+- The sizes in the description don't match the actual pages (e.g. 36879 vs
+  36880 rows; level 1 says 13000 × 17920 but is 13023 × 18440). The converter
+  trusts only the TIFF tags.
+- `Q=30` is the scanner's JPEG quality: the source is already lossy, which is why
+  the converter copies the original tiles instead of re-encoding them (see
+  *Brightfield output* above).
+
 ### Python API
 
 ```python

@@ -16,6 +16,8 @@ build/
 
 # Large slide data (never commit raw images)
 *.kfbf
+*.svs
+*.part
 *.ome.tif
 *.ome.tiff
 *.tif
