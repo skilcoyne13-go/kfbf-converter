@@ -203,7 +203,8 @@ def test_estimates_bound_real_outputs(kfbf, svs, tmp_path):
         w = kc._PyramidWriter(s, 512, "deflate", 2, show_progress=False, levels=levels)
         est = kc.estimate_output(s, "brightfield", w, copy_tiles=True)
         p = kc.write_brightfield(s, out / "copy.tif", w, copy_tiles=True)
-        assert est.exact and p.stat().st_size <= est.estimate <= p.stat().st_size + 2 ** 20
+        # exact tile bytes; only the (small) thumbnail page is estimated
+        assert est.exact and p.stat().st_size <= est.estimate <= p.stat().st_size + 2 ** 21
 
 
 # ---- errors while writing ------------------------------------------------------

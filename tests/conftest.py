@@ -257,10 +257,15 @@ def _quiet_logger():
 
 
 def tiff_levels(path: Path) -> dict:
-    """Read structure of a written pyramid: top pages + SubIFD levels."""
+    """Read structure of a written pyramid: level 0 + SubIFD levels, or for
+    the Aperio layout level 0 + top-level pages 2.. (page 1 = thumbnail)."""
     with tifffile.TiffFile(path) as t:
         top = t.pages[0]
-        subs = list(tifffile.TiffPages(top)) if top.subifds else []
+        aperio = not top.subifds and t.is_svs
+        if aperio:
+            subs = [t.pages[i] for i in range(2, len(t.pages))]
+        else:
+            subs = list(tifffile.TiffPages(top)) if top.subifds else []
         levels = []
         for pg in [top] + subs:
             xres = pg.tags["XResolution"].value
@@ -272,6 +277,8 @@ def tiff_levels(path: Path) -> dict:
                 subsampling=(pg.tags["YCbCrSubSampling"].value
                              if "YCbCrSubSampling" in pg.tags else None)))
         return dict(n_pages=len(t.pages), is_ome=t.is_ome, ome_xml=t.ome_metadata,
+                    aperio=aperio, description=top.description,
+                    thumbnail_shape=tuple(t.pages[1].shape) if aperio else None,
                     levels=levels,
                     arrays=[lv.asarray() for lv in t.series[0].levels],
                     n_series_levels=len(t.series[0].levels))

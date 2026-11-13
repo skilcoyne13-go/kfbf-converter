@@ -54,7 +54,9 @@ Older KFBio `.kfb` files are not supported.
   format.
 
 Every output is a tiled, pyramidal file. It holds the full resolution plus
-downsampled levels, so it opens and zooms instantly in QuPath.
+downsampled levels, so it opens and zooms instantly in QuPath. The objective
+magnification (e.g. 40×) is stored too, so QuPath can show "40.0x" rather
+than a zoom factor.
 
 ---
 
@@ -129,8 +131,10 @@ python kfbf_converter.py slide.svs --info
 ### Brightfield output (`.svs`)
 
 Each `.svs` gives one file, `slide.tif`: a tiled, pyramidal RGB BigTIFF
-(photometric RGB, chunky samples, pyramid in SubIFDs) with the pixel size in
-standard TIFF resolution tags. `--mode` does not apply; if you pass one, a single
+(photometric RGB, chunky samples) with the pixel size in standard TIFF
+resolution tags. It uses the same page layout as an Aperio `.svs`, so viewers
+that read slides with OpenSlide see the whole pyramid, the objective
+magnification and the pixel size (see *Magnification* below). `--mode` does not apply; if you pass one, a single
 info line says it was ignored for that slide.
 
 By default the scanner's original JPEG tiles are **copied unchanged**: no
@@ -167,6 +171,27 @@ copy is both the smallest and the most faithful option.
 | `-v, --verbose` | off | Debug output, including size estimates and error tracebacks |
 
 Run `python kfbf_converter.py --help` for the full list.
+
+### Magnification
+
+The objective magnification is read from the slide (`.kfbf` header,
+`.svs` `AppMag`) and written into every output. `--info` shows it, e.g.
+`Magnification : 40x (header)`. If it's missing or wrong, set it with
+`--magnification 40`.
+
+| Output | How the magnification is stored | Checked with |
+|---|---|---|
+| `.ome.tif` | OME-XML `Instrument > Objective NominalMagnification`, linked from the image | official OME 2016-06 schema |
+| `.tif` (brightfield), `.rgb.tif`, `_DAPI.tif` … | Aperio layout: levels as top-level pages, a thumbnail as page 2, and `Aperio Format … \|AppMag = 40\|MPP = 0.2528` descriptions | OpenSlide 4.0.1: all levels, `objective-power` and `mpp` read correctly |
+
+Before 1.1, the BigTIFFs stored lower levels as SubIFDs, which OpenSlide
+ignores: it saw only full resolution, with no pyramid and no magnification.
+Fluorescence Z-stacks (several Z planes) keep the SubIFD layout for their
+BigTIFFs, because the Aperio layout holds a single plane; their OME-TIFF still
+has the magnification.
+
+Bio-Formats (the other reader QuPath uses) has **not** been tested on the
+Aperio-layout `.tif` files; it may list each level as a separate image.
 
 ### Size checks and file safety
 
@@ -233,8 +258,14 @@ verified.
    **Image → Set image type**. QuPath can also guess it automatically
    (*Preferences → Auto-estimate image type on opening*).
 3. In the **Image** tab, check that **Pixel width** and **Pixel height** match
-   the `MPP` shown by `--info` (e.g. 0.4859 µm), and that zooming out is smooth
-   (pyramid levels are loaded).
+   the `MPP` shown by `--info` (e.g. 0.4859 µm), that **Magnification** is 20
+   (KFBio brightfield scans are 20×), and that zooming out is smooth (pyramid
+   levels are loaded).
+4. Zoom to full resolution: the toolbar should show **20.0x**.
+
+*Checked with OpenSlide and tifffile, but not yet in QuPath itself.* If QuPath
+shows no magnification or only one resolution level, note which reader it
+used (**Image** tab → **Server type**) and share it.
 
 ---
 
@@ -248,6 +279,8 @@ verified.
 | `Data is too big for the file format chosen.` | Follow the **Fix:** line under it. Usually: save to an NTFS or exFAT drive with `-o` (FAT32 USB sticks can't hold files over 4 GB), free up disk space, or use `--compression jpeg` for a smaller file. If you're sure it fits, try `--no-preflight` |
 | `Output failed verification and was deleted: ...` | The written file didn't read back correctly and was removed. Check the drive (try another one with `-o`), then run again with `-v` and share the output |
 | `unrecognised slide file` | Only KFBio `.kfbf` (fluorescence) and Aperio `.svs` (brightfield) slides are supported; older `.kfb` files are not |
+| `already converted by kfbf_converter` | That file is an output of this tool; convert the original `.svs` / `.kfbf` instead |
+| QuPath shows a zoom like "1.33x" instead of "40.0x" | Check `--info`: if it says `Magnification : unknown`, convert again with `--magnification 40` (and `--overwrite`) |
 | Wrong or generic channel names | Set them with `--channel-names` |
 | Image looks scrambled or wrong | Run `--info` on the slide and share the output |
 

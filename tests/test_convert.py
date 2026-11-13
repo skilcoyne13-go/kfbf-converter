@@ -45,7 +45,13 @@ def test_fluorescence_modes(kfbf, tmp_path, mode, names):
                                                          rel=1e-6)
                 assert got["unit"] == 3   # centimetre
                 assert got["tile"] == (512, 512)
-            assert [lv["subfiletype"] for lv in info["levels"]] == [0, 1]
+            if p.name.endswith(".ome.tif"):
+                assert [lv["subfiletype"] for lv in info["levels"]] == [0, 1]
+                assert not info["aperio"]
+            else:  # Aperio layout: levels are top-level pages, thumbnail is page 1
+                assert info["aperio"] and info["n_pages"] == len(export) + 1
+                assert [lv["subfiletype"] for lv in info["levels"]] == [0, 0]
+                assert "|AppMag = 40|MPP = 0.2528" in info["description"]
             if p.name.endswith(".ome.tif"):
                 assert info["is_ome"] and info["n_pages"] == 3
                 xml = info["ome_xml"]
@@ -80,13 +86,17 @@ def test_convert_slide_old_signature_still_works(kfbf, tmp_path):
 # ---- brightfield -------------------------------------------------------------
 
 def _check_bf_geometry(info, svs):
-    assert info["n_pages"] == 1 and info["n_series_levels"] == 3
+    assert info["aperio"] and info["n_pages"] == 4      # 3 levels + thumbnail
+    assert info["n_series_levels"] == 3
+    assert info["thumbnail_shape"] == (500, 700, 3)      # largest level <= 1024 px
+    assert info["description"].startswith(kc.APERIO_HEADER)
+    assert "|AppMag = 20|MPP = 0.5" in info["description"]
     for (w, h), got, ds in zip(svs.level_sizes, info["levels"], (1, 2, 4)):
         assert got["shape"] == (h, w, 3)
         assert got["planarconfig"] == 1    # contig
         assert got["px_per_cm"] == pytest.approx(1e4 / (svs.mpp * ds), rel=1e-6)
         assert got["unit"] == 3
-    assert [lv["subfiletype"] for lv in info["levels"]] == [0, 1, 1]
+    assert [lv["subfiletype"] for lv in info["levels"]] == [0, 0, 0]
 
 
 def test_brightfield_default_copies_tiles(svs, tmp_path):

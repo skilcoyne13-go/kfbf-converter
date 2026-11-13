@@ -120,7 +120,7 @@ def test_svs_short_level_extended_with_white(tmp_path):
     out = tmp_path / "out"
     (p,) = kc.convert_slide(info.path, out, show_progress=False)   # tile copy
     with tifffile.TiffFile(p) as t:
-        assert len(t.series) == 1
+        assert [s.name for s in t.series] == ["Baseline", "Thumbnail"]
         assert [lv.shape for lv in t.series[0].levels] == [(600, 1028, 3), (300, 514, 3),
                                                            (150, 257, 3)]
         last = t.series[0].levels[2].asarray()

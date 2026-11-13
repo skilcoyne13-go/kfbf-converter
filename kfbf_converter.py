@@ -1231,9 +1231,12 @@ def open_slide(path: str | os.PathLike, **kw) -> KFBioSlide | SVSSlide:
     path = Path(path)
     by_magic = detect_slide_type(path)
     by_ext = SLIDE_SUFFIXES.get(path.suffix.lower())
-    if by_magic == "brightfield" and by_ext != "brightfield":
+    if by_magic == "brightfield":
         with tifffile.TiffFile(path) as t:
-            if not t.is_svs:  # e.g. an already-converted .tif: never re-read it
+            desc = t.pages[0].description or ""
+            if desc.startswith(APERIO_HEADER):  # our own output: never re-convert it
+                raise SlideFormatError(f"{path.name}: already converted by kfbf_converter")
+            if by_ext != "brightfield" and not t.is_svs:
                 raise SlideFormatError(
                     f"{path.name}: TIFF file is not an Aperio .svs slide")
     kind = by_magic or by_ext
@@ -1350,7 +1353,8 @@ class _PyramidWriter:
               photometric: str, metadata: dict | None, ome: bool, desc: str,
               tile_size: int | None = None,
               encoded: Callable[[Level], dict] | None = None,
-              finalize: Callable[[Path], None] | None = None) -> Path:
+              finalize: Callable[[Path], None] | None = None,
+              thumbnail: Callable[[], np.ndarray] | None = None) -> Path:
         """fetch(level, plane, tx, ty) -> tile array (ts, ts, *sample_shape).
 
         With ``encoded``, fetch returns already-compressed JPEG tile bytes
@@ -1359,6 +1363,13 @@ class _PyramidWriter:
         writer's tile size (it must equal the source tile size then).
         ``finalize(part_path)`` may edit the finished file (e.g. metadata)
         before it is verified and renamed.
+
+        With ``thumbnail`` (single plane only) the file uses the Aperio
+        layout that OpenSlide reads as a pyramid with objective power:
+        level 0, then the thumbnail (``thumbnail()`` -> small array) as page
+        1, then the other levels as top-level pages, each with an
+        ``Aperio ...|AppMag = ..|MPP = ..`` description. Otherwise the
+        lower levels are SubIFDs of level 0.
         """
         slide, ts = self.slide, tile_size or self.ts
         levels = self.levels
@@ -1371,6 +1382,12 @@ class _PyramidWriter:
         bar = tqdm(total=total, desc=desc, unit="tile", leave=False,
                    disable=not self.show_progress, dynamic_ncols=True)
         level_shapes = [(lv.height, lv.width) + sample_shape for lv in levels]
+        aperio = thumbnail is not None
+        if aperio and len(planes) != 1:
+            raise ValueError("the Aperio layout holds a single plane")
+        codec = "raw" if encoded is None and self.compression is None else (
+            "JPEG" if encoded is not None or self.compression == "jpeg"
+            else _COMPRESSION_LABEL[self.compression])
         try:
             with tifffile.TiffWriter(tmp, bigtiff=self.bigtiff, ome=ome) as tif:
                 for lv in levels:
@@ -1404,7 +1421,15 @@ class _PyramidWriter:
                     )
                     if photometric == "rgb":
                         kw["planarconfig"] = "contig"
-                    if lv is levels[0]:
+                    if aperio:
+                        kw["metadata"] = None
+                        kw["description"] = aperio_description(
+                            slide, levels[0], lv, ts, codec, first=lv is levels[0])
+                        # every level page is subfiletype 0, as in Aperio/KFBio
+                        # files (1 = label, 9 = macro for SVS readers)
+                        if lv is levels[0]:
+                            kw["software"] = f"kfbf_converter {__version__}"
+                    elif lv is levels[0]:
                         kw["subifds"] = len(levels) - 1
                         kw["metadata"] = metadata
                         kw["software"] = f"kfbf_converter {__version__}"
@@ -1422,11 +1447,22 @@ class _PyramidWriter:
                     else:
                         kw.update(maxworkers=1)
                     tif.write(tiles(), **kw)
+                    if aperio and lv is levels[0]:  # Aperio: thumbnail is page 1
+                        thumb = np.ascontiguousarray(thumbnail(), dtype=np.uint8)
+                        tkw = dict(compression=self.compression or None)
+                        if encoded is not None:
+                            tkw = dict(compression="jpeg", compressionargs={"level": 90})
+                        tif.write(thumb, photometric=photometric, metadata=None,
+                                  description=f"Aperio Format thumbnail "
+                                              f"{thumb.shape[1]}x{thumb.shape[0]}",
+                                  **({"planarconfig": "contig"} if thumb.ndim == 3 else {}),
+                                  **tkw)
             bar.close()
             if finalize is not None:
                 finalize(tmp)
             # Never leave a file the user can't open: read it back first.
-            verify_output(tmp, level_shapes, n_pages=len(planes), ome=ome)
+            verify_output(tmp, level_shapes, n_pages=len(planes), ome=ome,
+                          layout="aperio" if aperio else "subifd")
             os.replace(tmp, out_path)
         except BaseException as exc:
             try:
@@ -1444,6 +1480,32 @@ class _PyramidWriter:
         finally:
             bar.close()
         return out_path
+
+
+APERIO_HEADER = "Aperio Format written by kfbf_converter"
+THUMBNAIL_MAX = 1024
+
+
+def aperio_description(slide, level0: Level, lv: Level, tile: int, codec: str,
+                       first: bool) -> str:
+    """Aperio-style ImageDescription. OpenSlide reads ``AppMag`` as
+    openslide.objective-power and ``MPP`` (level-0 µm/px) as openslide.mpp-x/y
+    from the first page; every level repeats them, as Aperio/KFBio files do."""
+    w0, h0 = level0.width, level0.height
+    size = (f"{w0}x{h0} [0,0 {w0}x{h0}] ({tile}x{tile})" if first
+            else f"{w0}x{h0} -> {lv.width}x{lv.height}")
+    text = f"{APERIO_HEADER} {__version__}\r\n{size} {codec}"
+    if slide.magnification:
+        text += f"|AppMag = {format_magnification(slide.magnification)}"
+    return text + f"|MPP = {slide.mpp:.6g}"
+
+
+def thumbnail_level(slide) -> int:
+    """Largest pyramid level (stored or synthetic) that fits THUMBNAIL_MAX."""
+    for lv in slide.levels:
+        if max(lv.width, lv.height) <= THUMBNAIL_MAX:
+            return lv.index
+    return slide.n_levels - 1
 
 
 def _region(slide: "_SlideBase", level: int, tx: int, ty: int, ts: int) -> tuple[int, int, int, int]:
@@ -1546,19 +1608,26 @@ def write_rgb(slide: KFBioSlide, out_path: Path, writer: _PyramidWriter,
         log.info("%s: stretch %s -> [%d, %d]", slide.path.stem, name, lo, hi)
     luts = _composite_luts(limits, slide.channel_colors)
 
-    def fetch(level, z, tx, ty):
-        x, y, w, h = _region(slide, level, tx, ty, writer.ts)
+    def composite(level, z, x, y, w, h):
         acc = np.zeros((h, w, 3), np.float32)
         for c in range(slide.n_channels):
             acc += luts[c][slide.read_region(level, x, y, w, h, c, z)]
         np.clip(acc, 0, 255, out=acc)
         return (acc + 0.5).astype(np.uint8)
 
+    def fetch(level, z, tx, ty):
+        return composite(level, z, *_region(slide, level, tx, ty, writer.ts))
+
+    def thumb():
+        lv = slide.levels[thumbnail_level(slide)]
+        return composite(lv.index, 0, 0, 0, lv.width, lv.height)
+
     metadata = None  # Z planes (if any) are written as consecutive pages
     return writer.write(out_path, planes=list(range(slide.n_z)), lead_shape=(slide.n_z,),
                         sample_shape=(3,),
                         fetch=fetch, photometric="rgb", metadata=metadata, ome=False,
-                        desc=f"RGB  {slide.path.stem}")
+                        desc=f"RGB  {slide.path.stem}",
+                        thumbnail=thumb if slide.n_z == 1 else None)
 
 
 def safe_channel_names(names: Sequence[str]) -> list[str]:
@@ -1581,17 +1650,23 @@ def write_split(slide: KFBioSlide, out_path: Path, channel: int,
         x, y, w, h = _region(slide, level, tx, ty, writer.ts)
         return slide.read_region(level, x, y, w, h, channel, z)
 
+    def thumb():
+        lv = slide.levels[thumbnail_level(slide)]
+        return slide.read_region(lv.index, 0, 0, lv.width, lv.height, channel)
+
     metadata = None  # Z planes (if any) are written as consecutive pages
     return writer.write(out_path, planes=list(range(slide.n_z)), lead_shape=(slide.n_z,),
                         sample_shape=(),
                         fetch=fetch, photometric="minisblack", metadata=metadata,
-                        ome=False, desc=f"{slide.channel_names[channel]:<5.5s} {slide.path.stem}")
+                        ome=False, desc=f"{slide.channel_names[channel]:<5.5s} {slide.path.stem}",
+                        thumbnail=thumb if slide.n_z == 1 else None)
 
 
 def write_brightfield(slide: SVSSlide, out_path: Path, writer: _PyramidWriter,
                       copy_tiles: bool = False) -> Path:
     """RGB pyramidal BigTIFF for a brightfield slide (photometric RGB,
-    contiguous samples, resolution in pixels/cm, pyramid in SubIFDs).
+    contiguous samples, resolution in pixels/cm, Aperio page layout with
+    AppMag/MPP so OpenSlide sees the pyramid and objective power).
 
     With ``copy_tiles`` the stored JPEG tiles are copied unchanged (no
     re-compression, so no extra quality loss); this requires JPEG/YCbCr
@@ -1599,6 +1674,11 @@ def write_brightfield(slide: SVSSlide, out_path: Path, writer: _PyramidWriter,
     """
     planes = list(range(slide.n_z))
     desc = f"BF   {slide.path.stem}"
+
+    def thumb():
+        lv = slide.levels[thumbnail_level(slide)]
+        return slide.read_region(lv.index, 0, 0, lv.width, lv.height)
+
     if copy_tiles:
         plan, why = slide.copy_tiles_plan(writer.levels)
         if plan is None:
@@ -1611,14 +1691,16 @@ def write_brightfield(slide: SVSSlide, out_path: Path, writer: _PyramidWriter,
         return writer.write(out_path, planes=planes, lead_shape=(slide.n_z,),
                             sample_shape=(3,), fetch=fetch_raw, photometric="rgb",
                             metadata=None, ome=False, desc=desc,
-                            tile_size=slide.tile_size, encoded=lambda lv: plan[lv.index])
+                            tile_size=slide.tile_size, encoded=lambda lv: plan[lv.index],
+                            thumbnail=thumb)
 
     def fetch(level, z, tx, ty):
         x, y, w, h = _region(slide, level, tx, ty, writer.ts)
         return slide.read_region(level, x, y, w, h, z)
 
     return writer.write(out_path, planes=planes, lead_shape=(slide.n_z,), sample_shape=(3,),
-                        fetch=fetch, photometric="rgb", metadata=None, ome=False, desc=desc)
+                        fetch=fetch, photometric="rgb", metadata=None, ome=False, desc=desc,
+                        thumbnail=thumb)
 
 
 # --------------------------------------------------------------------------
@@ -1687,6 +1769,10 @@ def estimate_output(slide, kind: str, writer: "_PyramidWriter",
     overhead = n_tiles * entry + len(writer.levels) * planes * 1024 + 256 * 1024
     if kind == "ome":
         overhead += planes * 512
+    elif planes == 1:  # Aperio layout: thumbnail page (<= 1024 x 1024 x samples)
+        thumb = THUMBNAIL_MAX * THUMBNAIL_MAX * samples
+        overhead += int(thumb * compression_factor(
+            "jpeg" if copy_tiles else writer.compression, writer.jpeg_quality))
     uncompressed = n_tiles * ts * ts * samples + overhead
     if copy_tiles:
         data = 0
@@ -1891,23 +1977,42 @@ def map_write_error(exc: BaseException, out_path: Path, written: int) -> DataToo
 
 
 def verify_output(path: Path, level_shapes: Sequence[tuple], n_pages: int,
-                  ome: bool = False) -> None:
+                  ome: bool = False, layout: str = "subifd") -> None:
     """Re-open a written file and check it is usable: page and SubIFD counts,
     the shape of every level, tile data inside the file, and one decoded
-    tile per level. Raises VerificationError."""
+    tile per level. Raises VerificationError.
+
+    ``layout="subifd"``: ``n_pages`` top-level pages (planes), each with the
+    lower levels as SubIFDs. ``layout="aperio"``: one plane; level 0, a
+    thumbnail, then the other levels as top-level pages."""
     try:
         size = path.stat().st_size
         with tifffile.TiffFile(path) as tif:
             pages = tif.pages
-            if len(pages) != n_pages:
-                raise VerificationError(f"expected {n_pages} image page(s), found {len(pages)}")
+            if layout == "aperio":
+                expected = len(level_shapes) + 1
+                if len(pages) != expected:
+                    raise VerificationError(f"expected {expected} image page(s) "
+                                            f"(levels + thumbnail), found {len(pages)}")
+                if not tif.is_svs:
+                    raise VerificationError("Aperio description is missing")
+                thumb = pages[1].asarray()
+                if thumb.size == 0 or pages[1].is_tiled:
+                    raise VerificationError("thumbnail page is missing or invalid")
+                plane_levels = [[pages[0]] + [pages[i] for i in range(2, expected)]]
+            else:
+                if len(pages) != n_pages:
+                    raise VerificationError(f"expected {n_pages} image page(s), "
+                                            f"found {len(pages)}")
+                plane_levels = []
+                for pi in range(n_pages):
+                    top = pages[pi]
+                    subs = tifffile.TiffPages(top) if top.subifds else []
+                    plane_levels.append([top] + list(subs))
             if ome and not tif.is_ome:
                 raise VerificationError("OME-XML metadata is missing")
             fh = tif.filehandle
-            for pi in range(n_pages):
-                top = pages[pi]
-                subs = tifffile.TiffPages(top) if top.subifds else []
-                levels = [top] + list(subs)
+            for pi, levels in enumerate(plane_levels):
                 if len(levels) != len(level_shapes):
                     raise VerificationError(f"expected {len(level_shapes)} pyramid level(s), "
                                             f"found {len(levels)}")
@@ -2066,6 +2171,9 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
                 except OSError as exc:
                     log.warning("could not remove stale partial file %s: %s", stale, exc)
         for kind, out, ch in jobs:
+            if out.resolve() == path.resolve():
+                raise SlideFormatError(f"{path.name}: output {out.name} would overwrite "
+                                       f"the input slide; choose another -o folder")
             if out.exists() and not overwrite:
                 log.info("skip existing %s (use --overwrite)", out)
                 continue
