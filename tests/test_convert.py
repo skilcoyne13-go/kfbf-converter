@@ -198,6 +198,20 @@ def test_bat_window_title_and_crlf():
     assert bat.count(b"\n") == bat.count(b"\r\n")          # CRLF only
 
 
+def test_bat_python_search_and_addon_fallback_list():
+    root = Path(kc.__file__).parent
+    bat = (root / "run_converter.bat").read_text()
+    tries = [line.split("call :try_python ", 1)[1] for line in bat.splitlines()
+             if "call :try_python " in line]
+    assert tries == ["py -3", "python", "python3"]
+    # the list used when requirements.txt isn't next to the launcher must match it
+    reqs = [r.strip() for r in (root / "requirements.txt").read_text().splitlines()
+            if r.strip() and not r.startswith("#")]
+    fallback = next(line for line in bat.splitlines()
+                    if "-m pip install" in line and "-r" not in line)
+    assert fallback.split("-m pip install", 1)[1].split() == [f'"{r}"' for r in reqs]
+
+
 def test_artist_and_software_tags_on_every_output(kfbf, svs, tmp_path):
     from conftest import make_qptiff, make_tiff
     out = _out(tmp_path)
