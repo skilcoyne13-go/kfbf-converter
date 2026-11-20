@@ -52,7 +52,9 @@ grayscale TIFFs.
   overview and label images are left out.
 - **Plain TIFF to pyramidal BigTIFF**: RGB or grayscale `.tif`/`.tiff` images
   (even huge single-resolution ones) get a full pyramid, so they open and zoom
-  quickly in QuPath. Damaged or incomplete TIFFs are reported and skipped.
+  quickly in QuPath. Tiled JPEG, deflate and LZW tiles are copied unchanged, so
+  the output is **about the same size as the input**. Damaged or incomplete
+  TIFFs are reported and skipped.
 - **Clear size errors**: before writing, every output is checked against the
   file format, the destination drive (e.g. FAT32's 4 GB file limit) and the
   free space. If it can't fit, you get
@@ -223,6 +225,17 @@ them; otherwise `--mpp` / `--magnification` are used. A TIFF that is already
 pyramidal is still rewritten (it may lack levels or metadata), and the log
 says so.
 
+**Output size**: outputs are about the same size as the inputs. When the
+TIFF's tiles are JPEG, deflate or LZW, they are **copied unchanged**, like
+`.svs` and `.qptiff` tiles: no re-compression, no extra quality loss.
+Only what's missing is built by decoding: pyramid levels the file doesn't
+have, or levels tiled differently from full resolution. So a single-level
+TIFF grows by the size of its new lower levels (about a third). Tiles that
+can't be copied (strips, uncompressed, or other codecs) are re-encoded. For
+RGB images this uses JPEG (quality 90) by default to keep the size down; the
+log says so. Add `--compression deflate` for a lossless (much bigger) file.
+An explicit `--compression` or `--tile-size` always re-encodes everything.
+
 **Output name**: `image.tif`, unless that would clash, in which case it's
 `image.bigtiff.tif`. That happens when the input is itself `image.tif`, when
 another program's `image.tif` is already there, or when an `image.svs` or
@@ -244,7 +257,7 @@ cannot be converted`, and the rest of the batch continues.
 | `-o, --output-dir` | next to the input | Where to save the converted files |
 | `--types` | all found | Only convert these types: `tif`, `svs`, `qptiff`, `kfbf` (no menu) |
 | `-y, --yes` | off | Don't ask anything; convert everything found with the defaults |
-| `--compression` | `deflate` (`.svs`, 8-bit `.qptiff`: copy tiles) | `deflate` or `lzw` (lossless), or `jpeg` (smaller, lossy) |
+| `--compression` | copy tiles where possible (`.svs`, `.qptiff`, tiled `.tif`); else `deflate`, or `jpeg` for RGB `.tif` | `deflate` or `lzw` (lossless), or `jpeg` (smaller, lossy) |
 | `--overwrite` | off | Replace files that already exist |
 | `--recursive` | off | Also convert slides in sub-folders |
 | `--channel-names` | from slide | Rename the channels, e.g. `--channel-names DAPI CD3 CD8` (`.kfbf` and `.qptiff`) |

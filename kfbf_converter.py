@@ -1252,6 +1252,7 @@ class _PageSource:
         self.counts = np.asarray(page.databytecounts, np.int64)
         self.compression = int(page.compression)
         self.photometric = int(page.photometric)
+        self.predictor = int(getattr(page, "predictor", 1) or 1)
         self.jpegtables = page.jpegtables or None
         self.dtype = np.dtype(page.dtype)
         self.file_dtype = self.dtype.newbyteorder(byteorder)
@@ -1495,32 +1496,99 @@ class _TiffPagesSlide(_SlideBase):
             tile[:ph // 2, :pw // 2] = (small + 0.5).astype(self.dtype)
         return self._cache_put(key, tile)
 
-    # ---- tile copy (lossless passthrough) ---------------------------------
+    # ---- tile copy (passthrough of the stored, compressed tiles) ------------
+    # Lossless codecs whose tiles are copied as-is (with the source predictor).
+    # Other codecs (uncompressed, JPEG 2000, WebP, ZSTD, ...) are re-encoded so
+    # that every TIFF reader can open the output.
+    _COPY_LOSSLESS = {5: "lzw", 8: "zlib", 32946: "zlib"}
+
+    def _jpeg_sampling(self, src: _PageSource) -> tuple[int, int] | None:
+        """(h, v) luma sampling of a 3-component JPEG level, read from the SOF
+        of a few tiles; None if unreadable, inconsistent or chroma-upsampled."""
+        found = None
+        n = src.n_segments
+        for i in sorted({0, n // 2, n - 1}):
+            if src.counts[i] <= 0:
+                continue
+            off = int(src.offsets[i])
+            sof = jpeg_sof_info(bytes(self._mm[off:off + min(int(src.counts[i]), 4096)]))
+            if sof is None or len(sof.get("components", ())) != 3:
+                return None
+            (_, h, v), *chroma = sof["components"]
+            if any((ch, cv) != (1, 1) for _, ch, cv in chroma) or found not in (None, (h, v)):
+                return None
+            found = (h, v)
+        return found if found in ((1, 1), (2, 1), (2, 2), (4, 1)) else None
+
+    def _level_copy_kwargs(self, srcs: Sequence[_PageSource]) -> tuple[dict | None, str]:
+        """tifffile kwargs that reproduce one stored level's encoding, so its
+        tiles can be written unchanged; or (None, why not)."""
+        s0, ts = srcs[0], self.tile_size
+        if any(not s.tiled or (s.seg_w, s.seg_h) != (ts, ts) for s in srcs):
+            return None, "it is not tiled like the output"
+        if len({(s.compression, s.photometric, s.predictor, s.jpegtables) for s in srcs}) != 1:
+            return None, "its channels are stored differently"
+        if s0.compression == _TIFF_JPEG:
+            if s0.dtype != np.uint8:
+                return None, "its JPEG tiles are not 8-bit"
+            kw: dict = {"compression": "jpeg"}
+            if self.is_rgb:
+                if s0.spp != 3 or s0.photometric not in (_PHOTOMETRIC_RGB, _PHOTOMETRIC_YCBCR):
+                    return None, "its JPEG tiles are not plain RGB/YCbCr"
+                sub = self._jpeg_sampling(s0)
+                if sub is None:
+                    return None, "its JPEG subsampling could not be read"
+                kw["subsampling"] = sub
+                if s0.photometric == _PHOTOMETRIC_RGB:  # keep "RGB" (no YCbCr transform)
+                    kw["compressionargs"] = {"outcolorspace": "RGB"}
+            elif s0.spp != 1:
+                return None, "its JPEG tiles are not single-channel"
+            if s0.jpegtables:
+                kw["jpegtables"] = s0.jpegtables
+            return kw, ""
+        codec = self._COPY_LOSSLESS.get(s0.compression)
+        if codec is None:
+            name = "uncompressed" if s0.compression == 1 else \
+                s0.page.compression.name.replace("_", " ").lower()
+            return None, f"its tiles are {name}"
+        if any(np.count_nonzero(s.counts[:s.n_segments] <= 0) for s in srcs):
+            return None, "it has missing tiles"
+        if s0.predictor not in (1, 2):
+            return None, "it uses an unusual predictor"
+        if s0.dtype.itemsize > 1 and self._tif.byteorder != "<":
+            return None, "it is big-endian"
+        if self.is_rgb and (s0.spp != 3 or s0.photometric != _PHOTOMETRIC_RGB):
+            return None, "it is not plain RGB"
+        if not self.is_rgb and (s0.spp != 1 or s0.photometric != 1):
+            return None, "it is not plain grayscale"
+        return {"compression": codec, "predictor": s0.predictor == 2}, ""
+
     def copy_tiles_plan(self, levels: Sequence[Level]) -> tuple[dict | None, str]:
-        """Which ``levels`` can be written by copying the stored JPEG tiles
-        unchanged? ``({level_index: tifffile kwargs}, "")`` -- computed levels
-        are left out and get encoded -- or ``(None, reason)``."""
-        if self.is_rgb:
-            return None, "tile copy is only used for grayscale channels"
+        """Which stored ``levels`` can be written by copying their compressed
+        tiles unchanged? Returns ``({level_index: tifffile kwargs}, notes)``:
+        levels left out (computed, or stored in a way that can't be copied)
+        are decoded and encoded again, and ``notes`` says why for stored
+        ones. ``(None, reason)`` if no level can be copied."""
         plan: dict[int, dict] = {}
+        notes: list[str] = []
         for lv in levels:
             if lv.synthetic:
                 continue
-            srcs = self._src[lv.index]
-            for s in srcs:
-                if s.compression != _TIFF_JPEG:
-                    return None, f"source tiles are {s.page.compression.name}, not JPEG"
-                if s.dtype != np.uint8 or s.spp != 1:
-                    return None, "source JPEG tiles are not 8-bit grayscale"
-                if not s.tiled or (s.seg_w, s.seg_h) != (self.tile_size, self.tile_size):
-                    return None, f"level {lv.index} is not tiled like level 0"
-            tables = {s.jpegtables for s in srcs}
-            if len(tables) != 1:
-                return None, f"level {lv.index} channels use different JPEG tables"
-            plan[lv.index] = {"jpegtables": tables.pop()} if srcs[0].jpegtables else {}
+            kw, why = self._level_copy_kwargs(self._src[lv.index])
+            if kw is None:
+                notes.append(f"level {lv.index} is re-encoded because {why}")
+            else:
+                plan[lv.index] = kw
         if not plan:
-            return None, "no stored level to copy"
-        return plan, ""
+            return None, notes[0].split(" because ", 1)[1] if notes else "no stored level"
+        return plan, "; ".join(notes)
+
+    def rest_compression(self, plan: dict) -> str:
+        """Compression for the levels a tile copy re-encodes: JPEG next to
+        copied JPEG tiles (8-bit only), otherwise deflate."""
+        if self.dtype == np.uint8 and any(kw["compression"] == "jpeg" for kw in plan.values()):
+            return "jpeg"
+        return DEFAULT_COMPRESSION
 
     def raw_tile(self, level: int, col: int, row: int, channel: int = 0) -> bytes | None:
         """The stored (still encoded) bytes of one tile, or None if missing."""
@@ -1531,26 +1599,49 @@ class _TiffPagesSlide(_SlideBase):
         off, cnt = int(src.offsets[i]), int(src.counts[i])
         return self._mm[off:off + cnt] if cnt > 0 else None
 
-    def blank_jpeg(self) -> bytes:
-        """A black grayscale JPEG tile for missing tiles in a tile copy."""
+    def copied_tile(self, level: int, col: int, row: int, channel: int, kw: dict) -> bytes:
+        """A stored tile's bytes for a tile copy; a missing tile becomes a
+        blank (fill-colour) JPEG encoded like the level (``kw`` from the
+        plan). Lossless levels are only copied when no tile is missing."""
+        data = self.raw_tile(level, col, row, channel)
+        return bytes(data) if data is not None else self.blank_tile(kw)
+
+    def blank_tile(self, kw: dict) -> bytes:
+        sub = kw.get("subsampling")
+        rgb_coded = "compressionargs" in kw
+        key = ("blank", sub, rgb_coded)
         with self._lock:
-            hit = self._blank.get("gray")
+            hit = self._blank.get(key)
         if hit is None:
-            hit = imagecodecs.jpeg_encode(
-                np.zeros((self.tile_size, self.tile_size), np.uint8), level=90)
+            shape = (self.tile_size, self.tile_size) + ((3,) if self.is_rgb else ())
+            fill = np.full(shape, self.fill_value, np.uint8)
+            args = dict(level=90)
+            if self.is_rgb:
+                args["subsampling"] = sub
+                if rgb_coded:
+                    args.update(colorspace="RGB", outcolorspace="RGB")
+            hit = imagecodecs.jpeg_encode(fill, **args)
             with self._lock:
-                self._blank["gray"] = hit
+                self._blank[key] = hit
         return hit
 
-    def copy_bytes(self, levels: Sequence[Level], jpeg_quality: int = 90) -> tuple[int, bool]:
+    def blank_jpeg(self) -> bytes:
+        """A blank (fill-colour) JPEG tile for missing grayscale tiles."""
+        return self.blank_tile({})
+
+    def copy_bytes(self, levels: Sequence[Level], jpeg_quality: int = 90,
+                   compression: str | None = "jpeg") -> tuple[int, bool]:
         """(bytes, exact) of a tile copy of ``levels``: stored tile bytes for
-        copied levels, an estimate for computed (re-encoded) ones."""
+        copied levels, an estimate (``compression``) for re-encoded ones."""
         total, exact, ts = 0, True, self.tile_size
         planes = len(self._src[0])
+        samples = 3 if self.is_rgb else 1
+        plan = self.copy_tiles_plan(levels)[0] or {}
         for lv in levels:
-            if lv.synthetic:
+            if lv.index not in plan:
                 cells = math.ceil(lv.width / ts) * math.ceil(lv.height / ts)
-                total += int(cells * ts * ts * planes * compression_factor("jpeg", jpeg_quality))
+                total += int(cells * ts * ts * planes * samples * self.dtype.itemsize
+                             * compression_factor(compression, jpeg_quality))
                 exact = False
                 continue
             for s in self._src[lv.index]:
@@ -2055,9 +2146,10 @@ class _PyramidWriter:
         aperio = thumbnail is not None
         if aperio and len(planes) != 1:
             raise ValueError("the Aperio layout holds a single plane")
-        codec = "raw" if encoded is None and self.compression is None else (
-            "JPEG" if encoded is not None or self.compression == "jpeg"
-            else _COMPRESSION_LABEL[self.compression])
+        enc0 = encoded(levels[0]) if encoded is not None else None
+        comp0 = enc0.get("compression", "jpeg") if enc0 is not None else self.compression
+        codec = "raw" if comp0 is None else (
+            "JPEG" if comp0 == "jpeg" else _COMPRESSION_LABEL[comp0])
         try:
             with tifffile.TiffWriter(tmp, bigtiff=self.bigtiff, ome=ome) as tif:
                 for lv in levels:
@@ -2087,7 +2179,7 @@ class _PyramidWriter:
                         shape=lead + (lv.height, lv.width) + sample_shape,
                         dtype=dtype, tile=(ts, ts), photometric=photometric,
                         resolution=(res, res), resolutionunit="CENTIMETER",
-                        **(dict(compression="jpeg", **enc) if enc is not None
+                        **({"compression": "jpeg", **enc} if enc is not None
                            else self._compression_kwargs(photometric == "rgb")),
                     )
                     if photometric == "rgb":
@@ -2123,7 +2215,7 @@ class _PyramidWriter:
                     if aperio and lv is levels[0]:  # Aperio: thumbnail is page 1
                         thumb = np.ascontiguousarray(thumbnail(), dtype=dtype)
                         tkw = dict(compression=self.compression or None)
-                        if encoded is not None:
+                        if encoded is not None and dtype == np.uint8:
                             tkw = dict(compression="jpeg", compressionargs={"level": 90})
                         tif.write(thumb, photometric=photometric, metadata=None,
                                   description=f"Aperio Format thumbnail "
@@ -2270,8 +2362,7 @@ def write_ome(slide: KFBioSlide | QPTIFFSlide, out_path: Path, writer: _PyramidW
     def fetch(level, plane, tx, ty):
         z, c = plane
         if level in plan:
-            raw = slide.raw_tile(level, tx, ty, c)
-            return bytes(raw) if raw is not None else slide.blank_jpeg()
+            return slide.copied_tile(level, tx, ty, c, plan[level])
         x, y, w, h = _region(slide, level, tx, ty, writer.ts)
         return slide.read_region(level, x, y, w, h, c, z)
 
@@ -2334,10 +2425,23 @@ def safe_channel_names(names: Sequence[str]) -> list[str]:
 
 
 def write_split(slide: KFBioSlide, out_path: Path, channel: int,
-                writer: _PyramidWriter) -> Path:
-    """Single-channel grayscale pyramidal BigTIFF."""
+                writer: _PyramidWriter, copy_tiles: bool = False) -> Path:
+    """Single-channel grayscale pyramidal BigTIFF.
+
+    With ``copy_tiles`` (a grayscale TIFF) the stored tiles of the levels in
+    the slide's copy plan are written unchanged; other levels are encoded.
+    """
+    plan: dict = {}
+    if copy_tiles:
+        plan, why = slide.copy_tiles_plan(writer.levels)
+        if plan is None:
+            raise SlideFormatError(f"cannot copy source tiles: {why}")
+        if writer.ts != slide.tile_size:
+            raise ValueError("tile copy needs the source tile size")
 
     def fetch(level, z, tx, ty):
+        if level in plan:
+            return slide.copied_tile(level, tx, ty, channel, plan[level])
         x, y, w, h = _region(slide, level, tx, ty, writer.ts)
         return slide.read_region(level, x, y, w, h, channel, z)
 
@@ -2350,7 +2454,8 @@ def write_split(slide: KFBioSlide, out_path: Path, channel: int,
                         sample_shape=(),
                         fetch=fetch, photometric="minisblack", metadata=metadata,
                         ome=False, desc=f"{slide.channel_names[channel]:<5.5s} {slide.path.stem}",
-                        thumbnail=thumb if slide.n_z == 1 else None)
+                        thumbnail=thumb if slide.n_z == 1 else None,
+                        encoded=(lambda lv: plan.get(lv.index)) if plan else None)
 
 
 def write_brightfield(slide: SVSSlide, out_path: Path, writer: _PyramidWriter,
@@ -2359,9 +2464,10 @@ def write_brightfield(slide: SVSSlide, out_path: Path, writer: _PyramidWriter,
     contiguous samples, resolution in pixels/cm, Aperio page layout with
     AppMag/MPP so OpenSlide sees the pyramid and objective power).
 
-    With ``copy_tiles`` the stored JPEG tiles are copied unchanged (no
-    re-compression, so no extra quality loss); this requires JPEG/YCbCr
-    source tiles and only stored (non-synthetic) levels, else SlideFormatError.
+    With ``copy_tiles`` the stored tiles are copied unchanged (no
+    re-compression, so no extra quality loss). For .svs this requires
+    JPEG/YCbCr tiles on every exported level, else SlideFormatError; for
+    TIFF/QPTIFF pages, levels that can't be copied are encoded instead.
     """
     planes = list(range(slide.n_z))
     desc = f"BF   {slide.path.stem}"
@@ -2374,15 +2480,22 @@ def write_brightfield(slide: SVSSlide, out_path: Path, writer: _PyramidWriter,
         plan, why = slide.copy_tiles_plan(writer.levels)
         if plan is None:
             raise SlideFormatError(f"cannot copy source tiles: {why}")
+        ts = slide.tile_size
 
         def fetch_raw(level, z, tx, ty):
-            data = slide.raw_tile(level, tx, ty)
-            return bytes(data) if data is not None else                 slide.blank_jpeg(plan[level]["subsampling"])
+            if level not in plan:  # TIFF level that can't be copied: encode it
+                x, y, w, h = _region(slide, level, tx, ty, ts)
+                return slide.read_region(level, x, y, w, h)
+            if isinstance(slide, SVSSlide):
+                data = slide.raw_tile(level, tx, ty)
+                return bytes(data) if data is not None else \
+                    slide.blank_jpeg(plan[level]["subsampling"])
+            return slide.copied_tile(level, tx, ty, 0, plan[level])
 
         return writer.write(out_path, planes=planes, lead_shape=(slide.n_z,),
                             sample_shape=(3,), fetch=fetch_raw, photometric="rgb",
                             metadata=None, ome=False, desc=desc,
-                            tile_size=slide.tile_size, encoded=lambda lv: plan[lv.index],
+                            tile_size=ts, encoded=lambda lv: plan.get(lv.index),
                             thumbnail=thumb)
 
     def fetch(level, z, tx, ty):
@@ -2466,8 +2579,8 @@ def estimate_output(slide, kind: str, writer: "_PyramidWriter",
             "jpeg" if copy_tiles else writer.compression, writer.jpeg_quality))
     itemsize = np.dtype(getattr(slide, "dtype", np.uint8)).itemsize
     uncompressed = n_tiles * ts * ts * samples * itemsize + overhead
-    if copy_tiles and hasattr(slide, "copy_bytes"):   # QPTIFF: copied + computed levels
-        data, exact = slide.copy_bytes(writer.levels, writer.jpeg_quality)
+    if copy_tiles and hasattr(slide, "copy_bytes"):   # TIFF/QPTIFF: copied + encoded levels
+        data, exact = slide.copy_bytes(writer.levels, writer.jpeg_quality, writer.compression)
         estimate = data + overhead
     elif copy_tiles:
         data = 0
@@ -2824,6 +2937,27 @@ def _preflight_output(slide, kind: str, out: Path, writer: _PyramidWriter,
     return est
 
 
+def _setup_tile_copy(slide: "_TiffPagesSlide", export: Sequence[Level], path: Path,
+                     writer_ts: int, writer_comp: str) -> tuple[bool, int, str]:
+    """Plan a tile copy for a TIFF / QPTIFF: returns (copy_tiles, tile size,
+    compression for the levels that are re-encoded) and logs the outcome."""
+    plan, why = slide.copy_tiles_plan(export)
+    if plan is None:
+        log.info("%s: the stored tiles can't be copied (%s); re-encoding them",
+                 path.name, why)
+        return False, writer_ts, writer_comp
+    comp = slide.rest_compression(plan)
+    copied = sorted({kw["compression"] for kw in plan.values()})
+    names = "/".join("JPEG" if c == "jpeg" else _COMPRESSION_LABEL[c] for c in copied)
+    redo = [lv for lv in export if lv.index not in plan]
+    log.info("%s: copying the stored %s tiles unchanged (no re-compression)%s", path.name,
+             names, f"; {len(redo)} level(s) computed or re-encoded as "
+                    f"{'JPEG' if comp == 'jpeg' else comp}" if redo else "")
+    if why:
+        log.info("%s: %s", path.name, why)
+    return True, slide.tile_size, comp
+
+
 def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None = None,
                   mode: str | None = "ome", compression: str | None = None,
                   tile_size: int | None = None,
@@ -2888,6 +3022,9 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
             if mode is not None:
                 log.info("%s: --mode %s applies to KFBF slides only; writing the TIFF as "
                          "a grayscale BigTIFF", path.name, mode)
+            if compression is None and tile_size is None:
+                copy_tiles, writer_ts, writer_comp = _setup_tile_copy(
+                    slide, export, path, writer_ts, writer_comp)
         elif slide.kind == "brightfield":
             log.info("%s: %sbrightfield %dx%d RGB, %.4g um/px, exporting %d of %d levels (%s)",
                      path.name, "" if itype == "SVS" else f"{itype} ", slide.width,
@@ -2913,6 +3050,15 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
                 else:
                     log.info("%s: %s; re-encoding with %s", path.name, why,
                              DEFAULT_COMPRESSION)
+            elif compression is None and tile_size is None:  # TIFF / RGB QPTIFF
+                copy_tiles, writer_ts, writer_comp = _setup_tile_copy(
+                    slide, export, path, writer_ts, writer_comp)
+            if not copy_tiles and compression is None and itype == "TIFF":
+                # Re-encoding a JPEG-sized slide with deflate makes it ~10x bigger.
+                writer_comp = "jpeg"
+                log.info("%s: writing JPEG tiles (quality %d) to keep the output close to "
+                         "the input size; use --compression deflate for lossless",
+                         path.name, jpeg_quality)
         elif itype == "QPTIFF":
             log.info("%s: QPTIFF fluorescence %dx%d, %d ch %s, %d-bit, %.4g um/px, "
                      "exporting %d of %d levels (%s)", path.name, slide.width, slide.height,
@@ -2922,18 +3068,8 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
                 log.info("%s: --mode %s applies to KFBF slides only; a QPTIFF is written "
                          "as an OME-TIFF", path.name, mode)
             if compression is None and tile_size is None:
-                plan, why = slide.copy_tiles_plan(export)
-                copy_tiles = plan is not None
-                if copy_tiles:
-                    writer_ts, writer_comp = slide.tile_size, "jpeg"
-                    computed = sum(lv.synthetic for lv in export)
-                    log.info("%s: copying the stored JPEG tiles unchanged (no "
-                             "re-compression)%s", path.name,
-                             f"; {computed} lower level(s) computed and saved as JPEG"
-                             if computed else "")
-                else:
-                    log.info("%s: %s; re-encoding with %s", path.name, why,
-                             DEFAULT_COMPRESSION)
+                copy_tiles, writer_ts, writer_comp = _setup_tile_copy(
+                    slide, export, path, writer_ts, writer_comp)
         else:
             log.info("%s: %s fluorescence %dx%d, %d ch %s, %d Z, exporting %d of %d levels "
                      "(%s)", path.name, itype, slide.width, slide.height, slide.n_channels,
@@ -2962,7 +3098,7 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
             try:
                 if preflight:
                     _preflight_output(slide, kind, out, writer, copy_tiles and
-                                      kind in ("brightfield", "ome"))
+                                      kind in ("brightfield", "ome", "gray"))
                 if kind == "brightfield":
                     write_brightfield(slide, out, writer, copy_tiles=copy_tiles)
                 elif kind == "ome":
@@ -2970,7 +3106,8 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
                 elif kind == "rgb":
                     write_rgb(slide, out, writer, low_pct, high_pct)
                 else:  # "split" channel of a .kfbf, or a grayscale TIFF
-                    write_split(slide, out, ch, writer)
+                    write_split(slide, out, ch, writer,
+                                copy_tiles=copy_tiles and kind == "gray")
             except (DataTooBigError, VerificationError) as exc:
                 if errors is None:
                     raise

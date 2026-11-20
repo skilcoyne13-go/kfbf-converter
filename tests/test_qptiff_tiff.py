@@ -202,16 +202,155 @@ def test_tiff_preflight_too_big(tmp_path, monkeypatch, capsys):
 
 # ---- plain TIFF -------------------------------------------------------------------
 
-def test_tiff_rgb_to_bigtiff_never_overwrites_input(tmp_path):
+def test_tiff_rgb_to_bigtiff_never_overwrites_input(tmp_path, caplog):
     img = make_tiff(tmp_path / "photo.tif")              # stripped, deflate, 0.25 um/px
     before = (tmp_path / "photo.tif").read_bytes()
+    caplog.set_level(logging.INFO, logger="kfbf_converter")
     (p,) = kc.convert_slide(tmp_path / "photo.tif", None, show_progress=False)
     assert p == tmp_path / "photo.bigtiff.tif"            # same name as the input -> .bigtiff
     assert (tmp_path / "photo.tif").read_bytes() == before
     info = tiff_levels(p)
-    assert info["aperio"] and info["levels"][0]["photometric"] == "RGB"
-    assert info["levels"][0]["px_per_cm"] == pytest.approx(1e4 / 0.25)
+    # strips can't be copied: an RGB TIFF is re-encoded as JPEG by default
+    assert "writing JPEG tiles (quality 90)" in caplog.text
+    lv0 = info["levels"][0]
+    assert info["aperio"] and (lv0["photometric"], lv0["compression"]) == ("YCBCR", "JPEG")
+    assert lv0["px_per_cm"] == pytest.approx(1e4 / 0.25)
+    assert np.abs(info["arrays"][0].astype(int) - img).mean() < 3
+    # an explicit --compression always wins: deflate is lossless
+    (p,) = kc.convert_slide(tmp_path / "photo.tif", tmp_path / "out", compression="deflate",
+                            show_progress=False)
+    info = tiff_levels(p)
+    assert info["levels"][0]["photometric"] == "RGB"
     np.testing.assert_array_equal(info["arrays"][0], img)
+
+
+def _tissue(height, width, seed=0):
+    """Smooth colour blobs plus fine noise: compresses like a real slide."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+    img = np.empty((height, width, 3), np.float32)
+    for c, (fy, fx) in enumerate(((97, 131), (149, 83), (61, 173))):
+        img[..., c] = 170 + 60 * np.sin(yy / fy) * np.cos(xx / fx)
+    img += rng.normal(0, 6, img.shape).astype(np.float32)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _jpeg_tiff(path, width=4096, height=3072, levels=5, coding="ycbcr", tile=256,
+               tile_of=None, gray=False):
+    """Pyramidal JPEG-tiled TIFF as scanners write it. ``coding``: "ycbcr"
+    (photometric YCbCr, 2x2 subsampled) or "rgb" (JPEG stored as RGB).
+    ``tile_of`` = {level: tile size} gives a level different tiles."""
+    img = _tissue(height, width)
+    if gray:
+        img = img[..., 1].copy()
+    kw = dict(compression="jpeg", metadata=None, resolutionunit="CENTIMETER",
+              photometric="minisblack" if gray else "rgb")
+    if not gray:
+        kw.update(subsampling=(2, 2)) if coding == "ycbcr" else kw.update(
+            subsampling=(1, 1), compressionargs={"level": 85, "outcolorspace": "RGB"})
+    kw.setdefault("compressionargs", {"level": 85})
+    with tifffile.TiffWriter(path, bigtiff=True) as t:
+        for li in range(levels):
+            ts = (tile_of or {}).get(li, tile)
+            t.write(img[::2 ** li, ::2 ** li], tile=(ts, ts),
+                    resolution=(1e4 / (0.25 * 2 ** li),) * 2,
+                    subifds=levels - 1 if li == 0 else None,
+                    subfiletype=1 if li else 0, **kw)
+    return img
+
+
+def _decoded_level0(path):
+    with tifffile.TiffFile(path) as t:
+        return t.pages[0].asarray()
+
+
+def _stored_tile(path, page, i):
+    with tifffile.TiffFile(path) as t:
+        pg = t.pages[page]
+        t.filehandle.seek(pg.dataoffsets[i])
+        return t.filehandle.read(pg.databytecounts[i])
+
+
+@pytest.mark.parametrize("coding", ["ycbcr", "rgb"])
+def test_tiff_jpeg_tiles_copied_same_size_identical_pixels(tmp_path, caplog, coding):
+    src = tmp_path / f"scan_{coding}.tiff"
+    _jpeg_tiff(src, coding=coding)
+    caplog.set_level(logging.INFO, logger="kfbf_converter")
+    (p,) = kc.convert_slide(src, tmp_path / "out", show_progress=False)
+    assert "copying the stored JPEG tiles unchanged" in caplog.text
+    assert "re-encoded" not in caplog.text                 # every level was copied
+    size_in, size_out = src.stat().st_size, p.stat().st_size
+    assert abs(size_out - size_in) <= 0.10 * size_in, (size_in, size_out)
+    np.testing.assert_array_equal(_decoded_level0(p), _decoded_level0(src))
+    assert _stored_tile(p, 0, 5) == _stored_tile(src, 0, 5)  # bytes copied as-is
+    info = tiff_levels(p)
+    lv0 = info["levels"][0]
+    assert lv0["photometric"] == ("YCBCR" if coding == "ycbcr" else "RGB")
+    assert lv0["compression"] == "JPEG" and lv0["tile"] == (256, 256)
+    assert [lv["shape"][:2] for lv in info["levels"]] == [
+        (3072 >> i, 4096 >> i) for i in range(5)]
+    assert info["aperio"] and "|MPP = 0.25" in info["description"]
+
+
+def test_tiff_jpeg_single_level_copies_level0_and_builds_the_rest(tmp_path, caplog):
+    src = tmp_path / "flat.tiff"
+    _jpeg_tiff(src, width=2048, height=1536, levels=1)
+    caplog.set_level(logging.INFO, logger="kfbf_converter")
+    (p,) = kc.convert_slide(src, tmp_path / "out", show_progress=False)
+    assert "copying the stored JPEG tiles unchanged" in caplog.text
+    assert "level(s) computed or re-encoded as JPEG" in caplog.text
+    np.testing.assert_array_equal(_decoded_level0(p), _decoded_level0(src))
+    info = tiff_levels(p)
+    assert all(lv["compression"] == "JPEG" for lv in info["levels"])
+    assert [lv["shape"][:2] for lv in info["levels"]] == [(1536, 2048), (768, 1024)]
+    # the computed levels are a fraction of level 0, not another full copy
+    assert p.stat().st_size < 1.6 * src.stat().st_size
+
+
+def test_tiff_misaligned_level_is_rebuilt_others_copied(tmp_path, caplog):
+    src = tmp_path / "odd.tiff"
+    _jpeg_tiff(src, width=2048, height=2048, levels=3, tile_of={1: 128})
+    caplog.set_level(logging.INFO, logger="kfbf_converter")
+    (p,) = kc.convert_slide(src, tmp_path / "out", show_progress=False)
+    assert "level 1 is re-encoded because it is not tiled like the output" in caplog.text
+    assert _stored_tile(p, 0, 3) == _stored_tile(src, 0, 3)  # level 0 copied
+    info = tiff_levels(p)
+    with tifffile.TiffFile(src) as t:
+        ref1 = t.series[0].levels[1].asarray()
+    assert info["levels"][1]["tile"] == (256, 256)
+    assert np.abs(info["arrays"][1].astype(int) - ref1).mean() < 3
+
+
+def test_tiff_grayscale_jpeg_and_deflate_tiles_copied(tmp_path):
+    _jpeg_tiff(tmp_path / "g.tiff", width=1024, height=1024, levels=3, gray=True)
+    (p,) = kc.convert_slide(tmp_path / "g.tiff", tmp_path / "out", show_progress=False)
+    assert _stored_tile(p, 0, 2) == _stored_tile(tmp_path / "g.tiff", 0, 2)
+    np.testing.assert_array_equal(_decoded_level0(p), _decoded_level0(tmp_path / "g.tiff"))
+    make_tiff(tmp_path / "d.tiff", width=1100, height=900, tiled=True, pyramid=2)
+    (p,) = kc.convert_slide(tmp_path / "d.tiff", tmp_path / "out2", show_progress=False)
+    assert _stored_tile(p, 0, 1) == _stored_tile(tmp_path / "d.tiff", 0, 1)  # lossless copy
+    assert tiff_levels(p)["levels"][0]["compression"] == "ADOBE_DEFLATE"
+
+
+def test_tiff_explicit_compression_wins_over_copy(tmp_path, caplog):
+    src = tmp_path / "scan.tiff"
+    _jpeg_tiff(src, width=1024, height=1024, levels=2)
+    caplog.set_level(logging.INFO, logger="kfbf_converter")
+    (p,) = kc.convert_slide(src, tmp_path / "out", compression="deflate", show_progress=False)
+    assert "copying the stored" not in caplog.text and "writing JPEG tiles" not in caplog.text
+    assert tiff_levels(p)["levels"][0]["compression"] == "ADOBE_DEFLATE"
+
+
+def test_tiff_copy_preflight_estimate_is_close(tmp_path):
+    src = tmp_path / "scan.tiff"
+    _jpeg_tiff(src, width=2048, height=2048, levels=4)
+    with kc.open_slide(src) as s:
+        export = kc.select_export_levels(s.levels)
+        w = kc._PyramidWriter(s, s.tile_size, "jpeg", 2, show_progress=False, levels=export)
+        est = kc.estimate_output(s, "brightfield", w, copy_tiles=True)
+        out = kc.write_brightfield(s, tmp_path / "o.tif", w, copy_tiles=True)
+    assert est.exact
+    assert out.stat().st_size <= est.estimate <= out.stat().st_size + 2 ** 21
 
 
 def test_tiff_extension_tiff_gets_plain_name(tmp_path):
