@@ -180,11 +180,15 @@ def test_open_slide_by_magic_then_extension(tmp_path, kfbf, svs, caplog):
         kc.open_slide(bad_kfbf)
 
 
-def test_open_slide_rejects_plain_tiff(tmp_path):
-    plain = tmp_path / "already_converted.tif"
+def test_open_slide_plain_tiff_by_extension(tmp_path):
+    plain = tmp_path / "plain.tif"          # plain .tif/.tiff images are inputs now
     tifffile.imwrite(plain, np.zeros((64, 64, 3), np.uint8), photometric="rgb")
+    with kc.open_slide(plain) as s:
+        assert isinstance(s, kc.TiffSlide) and s.input_type == "TIFF"
+    other = tmp_path / "plain.img"          # other extensions still need an Aperio .svs
+    other.write_bytes(plain.read_bytes())
     with pytest.raises(kc.SlideFormatError, match="not an Aperio .svs"):
-        kc.open_slide(plain)
+        kc.open_slide(other)
 
 
 def test_find_slides_suffixes(tmp_path):

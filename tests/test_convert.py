@@ -220,10 +220,15 @@ def test_menu_fluorescence_only_unchanged(tmp_path, monkeypatch, capsys):
 
 
 def test_menu_mixed_counts(mixed_dir, monkeypatch, capsys):
-    assert _interactive(monkeypatch, mixed_dir, ["2"]) == 0
+    # several types: first "what to convert" (Enter = all), then the .kfbf format
+    assert _interactive(monkeypatch, mixed_dir, ["", "2"]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("Found 1 fluorescence (.kfbf) and 1 brightfield (.svs) slide(s).\n")
-    assert MENU in out
+    assert out.startswith("Found 1 SVS, 1 KFBF slide(s).\n"
+                          "What do you want to convert?\n"
+                          "  [1] Convert all (Default - press Enter)\n"
+                          "  [2] Only SVS    -> BigTIFF\n"
+                          "  [3] Only KFBF   -> choose the format next\n")
+    assert "Output format for the 1 KFBF slide(s):\n" + MENU in out
     assert sorted(p.name for p in mixed_dir.glob("*.tif")) == ["bright.tif", "fluo.rgb.tif"]
 
 

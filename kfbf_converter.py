@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-kfbf_converter.py - Convert KFBio whole-slide images into open
-computational-pathology formats.
+kfbf_converter.py - Convert whole-slide images (KFBio .kfbf, Aperio .svs,
+PerkinElmer/Akoya .qptiff and plain .tif/.tiff) into open, QuPath-ready
+pyramidal formats.
 
-Inputs
-------
-.kfbf  KFBio fluorescence slide (multi-channel grayscale JPEG tiles)
-.svs   Aperio brightfield slide, as written by KFBio scanners (RGB JPEG tiles)
+Inputs and what each becomes
+----------------------------
+.kfbf       KFBio fluorescence slide      -> OME-TIFF / RGB / split (see modes)
+.svs        Aperio brightfield slide      -> RGB pyramidal BigTIFF   <stem>.tif
+.qptiff     PerkinElmer/Akoya QPTIFF      -> multi-channel pyramidal OME-TIFF
+                                             <stem>.ome.tif (an RGB QPTIFF
+                                             gets the RGB BigTIFF instead)
+.tif/.tiff  plain RGB or grayscale image  -> pyramidal BigTIFF <stem>.tif, or
+                                             <stem>.bigtiff.tif if that name
+                                             is taken (e.g. by the input)
+
+Given a folder, the tool counts each type it finds and asks what to convert
+(--types / --yes skip the question). Files this tool wrote are never taken
+as inputs.
 
 Output modes (fluorescence .kfbf)
 ---------------------------------
@@ -28,12 +39,15 @@ Usage
 -----
     python kfbf_converter.py slide.kfbf --mode all -o out/
     python kfbf_converter.py slide.svs -o out/
-    python kfbf_converter.py slides_folder --mode ome -o out/   # .kfbf + .svs
+    python kfbf_converter.py slide.qptiff -o out/
+    python kfbf_converter.py slides_folder --types qptiff tif --yes -o out/
     python kfbf_converter.py slide.kfbf --info        # dump parsed structure
 
 As a module
 -----------
     from kfbf_converter import KFBioSlide, SVSSlide, open_slide, convert_slide
+    with open_slide("slide.qptiff") as slide:       # -> QPTIFFSlide
+        dapi = slide.read_region(level=3, x=0, y=0, width=512, height=512, channel=0)
     with KFBioSlide("slide.kfbf") as slide:
         tile = slide.get_tile(level=0, col=3, row=5, channel=0)
     with open_slide("slide.svs") as slide:          # -> SVSSlide
@@ -58,7 +72,7 @@ import struct
 import sys
 import threading
 import xml.etree.ElementTree as ElementTree
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -1729,6 +1743,98 @@ class QPTIFFSlide(_TiffPagesSlide):
         return "\n".join(lines)
 
 
+class TiffSlide(_TiffPagesSlide):
+    """Reader for plain ``.tif`` / ``.tiff`` images: RGB (8-bit) or
+    single-channel grayscale (8- or 16-bit), tiled or stripped, flat or
+    already pyramidal. Pixel size comes from the TIFF resolution tags,
+    magnification from an ``AppMag = `` in the description, if present.
+
+    A TIFF that cannot be read -- truncated, corrupt, or a scanner TIFF over
+    4 GB written as classic TIFF -- raises SlideFormatError("... this TIFF is
+    damaged or incomplete and cannot be converted").
+    """
+
+    input_type = "TIFF"
+
+    def __init__(self, path: str | os.PathLike, mpp_fallback: float = DEFAULT_MPP,
+                 tile_cache: int = 0, magnification: float | None = None):
+        super().__init__(path)
+        try:
+            self._open_tiff()
+            self._parse(mpp_fallback, magnification)
+        except Exception:
+            self.close()
+            raise
+
+    def _parse(self, mpp_fallback: float, magnification: float | None) -> None:
+        tif, name = self._tif, self.path.name
+        self.is_bigtiff = tif.is_bigtiff
+        try:
+            series = tif.series[0]
+            stacks = [list(lv.pages) for lv in series.levels]
+            base = stacks[0][0]
+            self.description = base.description or ""
+        except Exception as exc:
+            raise self._damaged(f"cannot read the image list: {exc}") from exc
+        if base is None or len(stacks[0]) != 1:
+            raise SlideFormatError(
+                f"{name}: this TIFF holds {len(stacks[0])} images per level (several "
+                f"channels or a stack); only RGB or single-channel grayscale TIFFs "
+                f"can be converted")
+        spp, phot = int(base.samplesperpixel), int(base.photometric)
+        self.dtype = np.dtype(base.dtype)
+        self.width, self.height = int(base.imagewidth), int(base.imagelength)
+        if spp in (3, 4) and phot in (_PHOTOMETRIC_RGB, _PHOTOMETRIC_YCBCR):
+            if self.dtype != np.uint8:
+                raise SlideFormatError(f"{name}: {self.dtype} RGB TIFFs are not supported; "
+                                       f"only 8-bit RGB")
+            self.is_rgb, self.kind, self.fill_value, self.n_channels = \
+                True, "brightfield", 255, 3
+            self.channel_names = ["Red", "Green", "Blue"]
+            self.channel_colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+        elif spp == 1 and phot == 1:  # minisblack
+            if self.dtype not in (np.uint8, np.uint16):
+                raise SlideFormatError(f"{name}: {self.dtype} pixels are not supported "
+                                       f"(8- or 16-bit only)")
+            self.is_rgb, self.kind, self.fill_value, self.n_channels = \
+                False, "grayscale", 0, 1
+            self.channel_names, self.channel_colors = ["Gray"], [(255, 255, 255)]
+        else:
+            what = {3: "palette (indexed colour)", 0: "inverted grayscale",
+                    5: "CMYK"}.get(phot, f"{spp}-sample, photometric {phot}")
+            raise SlideFormatError(f"{name}: {what} TIFFs are not supported; only RGB or "
+                                   f"single-channel grayscale")
+        m = re.search(r"AppMag\s*=\s*([\d.]+)", self.description)
+        self._resolve_magnification(m.group(1) if m else None, "description", magnification)
+        mpp, self.mpp_source = _mpp_from_resolution(base), "resolution tags"
+        if mpp is None or not 0.01 <= mpp <= 100:
+            mpp, self.mpp_source = float(mpp_fallback), "fallback"
+            self._warn(f"no pixel size in file; using {mpp_fallback} um/px (set --mpp)")
+        self.mpp = float(f"{mpp:.6g}")
+        self.mpp_from_header = self.mpp_source != "fallback"
+        self.is_pyramidal = len(stacks) > 1
+        self.z_values = [0]
+        self.associated = [s.name for s in tif.series[1:] if s.name]
+        self._set_pyramid([pages[:1] for pages in stacks])
+
+    def summary(self, min_level_size: int = 256, max_levels: int | None = None) -> str:
+        src = self._src[0][0]
+        lines = [
+            f"File          : {self.path}",
+            f"Type          : TIFF {'RGB' if self.is_rgb else 'grayscale'} "
+            f"({self._pixel_text()}, {'BigTIFF' if self.is_bigtiff else 'classic TIFF'}, "
+            f"{'pyramidal' if self.is_pyramidal else 'single resolution'})",
+            f"Dimensions    : {self.width} x {self.height} px",
+            f"Magnification : {self.magnification_text()}",
+            f"MPP           : {self.mpp:.5g} um/px ({self.mpp_source})",
+            f"Storage       : {'tiles' if src.tiled else 'strips'} {src.seg_w}x{src.seg_h} "
+            f"{src.page.compression.name}",
+            f"Associated    : {', '.join(self.associated) or '-'} (not exported)",
+        ]
+        lines += self._levels_lines(min_level_size, max_levels)
+        return "\n".join(lines)
+
+
 SLIDE_SUFFIXES = {".kfbf": "fluorescence", ".svs": "brightfield"}
 
 
@@ -1773,7 +1879,8 @@ def open_slide(path: str | os.PathLike, **kw) -> KFBioSlide | SVSSlide | QPTIFFS
     if by_magic == "brightfield":
         peek = _peek_tiff(path)
         if peek is None:
-            raise SlideFormatError(f"{path.name}: this TIFF is damaged or incomplete and "
+            what = "QPTIFF" if path.suffix.lower() == ".qptiff" else "TIFF"
+            raise SlideFormatError(f"{path.name}: this {what} is damaged or incomplete and "
                                    f"cannot be converted")
         if peek["own"]:  # our own output: never re-convert it
             raise SlideFormatError(f"{path.name}: already converted by kfbf_converter")
@@ -1781,6 +1888,10 @@ def open_slide(path: str | os.PathLike, **kw) -> KFBioSlide | SVSSlide | QPTIFFS
             return QPTIFFSlide(path, **{k: v for k, v in kw.items()
                                         if k in ("mpp_fallback", "channel_names",
                                                  "magnification")})
+        is_tif = path.suffix.lower() in (".tif", ".tiff")
+        if is_tif and not peek["svs"]:
+            return TiffSlide(path, **{k: v for k, v in kw.items()
+                                      if k in ("mpp_fallback", "magnification")})
         if by_ext != "brightfield" and not peek["svs"]:
             raise SlideFormatError(
                 f"{path.name}: TIFF file is not an Aperio .svs slide")
@@ -1796,8 +1907,11 @@ def open_slide(path: str | os.PathLike, **kw) -> KFBioSlide | SVSSlide | QPTIFFS
         return KFBioSlide(path, **{k: v for k, v in kw.items()
                                    if k in ("mpp_fallback", "channel_names", "tile_cache",
                                             "magnification")})
-    return SVSSlide(path, **{k: v for k, v in kw.items()
-                             if k in ("mpp_fallback", "tile_cache", "magnification")})
+    slide = SVSSlide(path, **{k: v for k, v in kw.items()
+                              if k in ("mpp_fallback", "tile_cache", "magnification")})
+    if path.suffix.lower() in (".tif", ".tiff"):
+        slide.input_type = "TIFF"   # an Aperio-style .tif: read like .svs, named as TIFF
+    return slide
 
 
 # --------------------------------------------------------------------------
@@ -2627,6 +2741,9 @@ def planned_outputs(slide: "_SlideBase", output_dir: Path, mode: str | None
     """[(kind, output path, channel)] for a slide. Brightfield slides always
     give one RGB BigTIFF; ``mode`` applies to fluorescence slides only."""
     stem = _slide_stem(slide.path)
+    if getattr(slide, "input_type", "") == "TIFF":
+        out = tiff_output_path(slide.path, output_dir)
+        return [("brightfield", out, -1) if slide.kind == "brightfield" else ("gray", out, 0)]
     if slide.kind == "brightfield":
         return [("brightfield", output_dir / f"{stem}.tif", -1)]
     if getattr(slide, "input_type", "") == "QPTIFF":   # fluorescence QPTIFF: OME-TIFF only
@@ -2641,6 +2758,35 @@ def planned_outputs(slide: "_SlideBase", output_dir: Path, mode: str | None
         for i, n in enumerate(safe_channel_names(slide.channel_names)):
             jobs.append(("split", output_dir / f"{stem}_{n}.tif", i))
     return jobs
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        if a.exists() and b.exists():
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def tiff_output_path(src: Path, output_dir: Path) -> Path:
+    """Output name for a .tif/.tiff input: ``<stem>.tif``, or
+    ``<stem>.bigtiff.tif`` when that name would clash -- with the input
+    itself, with a file this tool didn't write, or with the output of a
+    ``<stem>.svs`` / ``<stem>.qptiff`` next to the input."""
+    stem = _slide_stem(src)
+    plain, alt = output_dir / f"{stem}.tif", output_dir / f"{stem}.bigtiff.tif"
+    if _same_path(plain, src):
+        return alt
+    if plain.exists() and not (_peek_tiff(plain) or {}).get("own"):
+        return alt
+    try:
+        siblings = {p.name.lower() for p in src.parent.iterdir()}
+    except OSError:
+        siblings = set()
+    if any(f"{stem}{ext}".lower() in siblings for ext in (".svs", ".qptiff")):
+        return alt
+    return plain
 
 
 DEFAULT_COMPRESSION = "deflate"
@@ -2677,11 +2823,17 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
                   show_progress: bool = True, min_level_size: int = 256,
                   max_levels: int | None = None, preflight: bool = True,
                   errors: list | None = None,
-                  magnification: float | None = None) -> list[Path]:
-    """Convert one .kfbf (fluorescence) or .svs (brightfield) slide.
+                  magnification: float | None = None,
+                  skipped: list | None = None) -> list[Path]:
+    """Convert one slide: .kfbf (KFBio fluorescence), .svs (brightfield),
+    .qptiff (PerkinElmer/Akoya) or a plain .tif/.tiff.
 
-    Returns the list of files written. ``mode`` applies to fluorescence
-    slides; brightfield slides always produce ``<stem>.tif``.
+    Returns the list of files written. ``mode`` applies to .kfbf slides;
+    .svs slides always produce ``<stem>.tif``, fluorescence .qptiff slides
+    ``<stem>.ome.tif``, and .tif/.tiff images ``<stem>.tif`` (or
+    ``<stem>.bigtiff.tif`` when that name is taken). Outputs that already
+    exist are skipped (appended to ``skipped`` if it is a list) unless
+    ``overwrite``.
     ``compression`` / ``tile_size`` default to deflate / 512 px; for
     brightfield, leaving both unset copies the stored JPEG tiles unchanged.
 
@@ -2715,7 +2867,18 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
             raise SlideFormatError(f"{path.name}: this {itype} has {slide.dtype.itemsize * 8}"
                                    f"-bit pixels, which JPEG cannot store; use "
                                    f"--compression deflate or lzw")
-        if slide.kind == "brightfield":
+        if itype == "TIFF" and getattr(slide, "is_pyramidal", False):
+            log.info("%s: this TIFF is already pyramidal; writing it again with every "
+                     "level and the metadata", path.name)
+        if slide.kind == "grayscale":
+            log.info("%s: TIFF grayscale %dx%d, %d-bit, %.4g um/px, exporting %d of %d "
+                     "levels (%s)", path.name, slide.width, slide.height,
+                     slide.dtype.itemsize * 8, slide.mpp, len(export), slide.n_levels,
+                     levels_txt)
+            if mode is not None:
+                log.info("%s: --mode %s applies to KFBF slides only; writing the TIFF as "
+                         "a grayscale BigTIFF", path.name, mode)
+        elif slide.kind == "brightfield":
             log.info("%s: %sbrightfield %dx%d RGB, %.4g um/px, exporting %d of %d levels (%s)",
                      path.name, "" if itype == "SVS" else f"{itype} ", slide.width,
                      slide.height, slide.mpp, len(export), slide.n_levels, levels_txt)
@@ -2783,6 +2946,8 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
                                        f"the input slide; choose another -o folder")
             if out.exists() and not overwrite:
                 log.info("skip existing %s (use --overwrite)", out)
+                if skipped is not None:
+                    skipped.append(out)
                 continue
             try:
                 if preflight:
@@ -2794,7 +2959,7 @@ def convert_slide(path: str | os.PathLike, output_dir: str | os.PathLike | None 
                     write_ome(slide, out, writer, copy_tiles=copy_tiles)
                 elif kind == "rgb":
                     write_rgb(slide, out, writer, low_pct, high_pct)
-                else:
+                else:  # "split" channel of a .kfbf, or a grayscale TIFF
                     write_split(slide, out, ch, writer)
             except (DataTooBigError, VerificationError) as exc:
                 if errors is None:
@@ -2828,6 +2993,88 @@ def slide_kind_by_suffix(path: Path) -> str | None:
     return SLIDE_SUFFIXES.get(path.suffix.lower())
 
 
+# Input types, in menu order
+INPUT_TYPES = ("TIFF", "SVS", "QPTIFF", "KFBF")
+INPUT_SUFFIXES = {".tif": "TIFF", ".tiff": "TIFF", ".svs": "SVS", ".qptiff": "QPTIFF",
+                  ".kfbf": "KFBF"}
+TYPE_FLAGS = {"tif": "TIFF", "tiff": "TIFF", "svs": "SVS", "qptiff": "QPTIFF", "kfbf": "KFBF"}
+SUPPORTED_TEXT = ".tif/.tiff, .svs, .qptiff or .kfbf"
+# names this tool writes (".part" = unfinished output)
+OUTPUT_NAME_ENDINGS = (".ome.tif", ".rgb.tif", ".bigtiff.tif", ".part")
+
+
+def own_output_reason(path: Path, sibling_names: set[str] | None = None) -> str | None:
+    """Why ``path`` is one of this tool's outputs (so never an input), or None:
+    an output name (.ome.tif, .rgb.tif, .bigtiff.tif, .part), ``<stem>.tif``
+    next to ``<stem>.svs``, a split channel ``<stem>_<channel>.tif`` next to
+    ``<stem>.kfbf``, or a Software tag starting with "kfbf_converter" (catches
+    renamed outputs)."""
+    name = path.name.lower()
+    if name.endswith(OUTPUT_NAME_ENDINGS):
+        return "output file name"
+    if path.suffix.lower() not in (".tif", ".tiff"):
+        return None
+    if sibling_names is None:
+        try:
+            sibling_names = {p.name.lower() for p in path.parent.iterdir()}
+        except OSError:
+            sibling_names = set()
+    stem = _slide_stem(path).lower()
+    if path.suffix.lower() == ".tif" and f"{stem}.svs" in sibling_names:
+        return f"made from {stem}.svs"
+    for i, ch in enumerate(stem):
+        if ch == "_" and f"{stem[:i]}.kfbf" in sibling_names:
+            return f"split channel of {stem[:i]}.kfbf"
+    if (_peek_tiff(path) or {}).get("own"):
+        return "written by kfbf_converter (Software tag)"
+    return None
+
+
+def input_type_of(path: Path) -> str | None:
+    """'TIFF' / 'SVS' / 'QPTIFF' / 'KFBF' for counting and messages: the
+    extension, except that any TIFF tifffile identifies as QPTIFF is QPTIFF."""
+    kind = INPUT_SUFFIXES.get(path.suffix.lower())
+    if kind in (None, "TIFF"):
+        try:
+            magic = detect_slide_type(path)
+        except OSError:
+            magic = None
+        if magic == "fluorescence":
+            return "KFBF"
+        if magic == "brightfield":
+            peek = _peek_tiff(path) or {}
+            if peek.get("qptiff"):
+                return "QPTIFF"
+            if kind is None:
+                return "SVS" if peek.get("svs") else "TIFF"
+    return kind
+
+
+def discover_slides(input_path: Path, recursive: bool = False) -> list[tuple[Path, str]]:
+    """[(path, input type)]. A file is returned as-is; a folder is searched
+    for .tif/.tiff, .svs, .qptiff and .kfbf files (case-insensitive), skipping
+    anything this tool wrote (see :func:`own_output_reason`)."""
+    if input_path.is_file():
+        return [(input_path, input_type_of(input_path) or "?")]
+    if not input_path.is_dir():
+        raise FileNotFoundError(f"input not found: {input_path}")
+    it = input_path.rglob("*") if recursive else input_path.iterdir()
+    siblings: dict[Path, set[str]] = {}
+    found = []
+    for p in sorted(it):
+        if not p.is_file() or p.suffix.lower() not in INPUT_SUFFIXES:
+            continue
+        names = siblings.get(p.parent)
+        if names is None:
+            names = siblings[p.parent] = {q.name.lower() for q in p.parent.iterdir()}
+        why = own_output_reason(p, names)
+        if why:
+            log.debug("ignoring %s: %s", p.name, why)
+            continue
+        found.append((p, input_type_of(p) or "?"))
+    return found
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -2843,15 +3090,22 @@ class _TqdmHandler(logging.Handler):
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="kfbf_converter",
-        description="Convert KFBio slides: fluorescence (.kfbf) to pyramidal OME-TIFF, "
-                    "composite RGB BigTIFF and/or per-channel grayscale BigTIFFs; "
-                    "brightfield (.svs) to an RGB pyramidal BigTIFF.")
+        description="Convert slides to open pyramidal formats: KFBio fluorescence "
+                    "(.kfbf) to OME-TIFF, composite RGB BigTIFF and/or per-channel "
+                    "grayscale BigTIFFs; PerkinElmer/Akoya .qptiff to OME-TIFF; "
+                    "brightfield .svs and plain .tif/.tiff images to a pyramidal BigTIFF.")
     p.add_argument("input", type=Path, nargs="?", default=None,
-                   help=".kfbf/.svs file or a directory containing them "
-                        "(omit to pick a format interactively for the current folder)")
+                   help="a slide file, or a folder of .tif/.tiff, .svs, .qptiff and .kfbf "
+                        "files (omit to use the current folder and choose from a menu)")
     p.add_argument("-m", "--mode", choices=MODES, default=None,
-                   help="fluorescence output type (default: ome); brightfield .svs "
-                        "slides always give one RGB BigTIFF")
+                   help="output type for .kfbf slides (default: ome); the other types "
+                        "always give one file each")
+    p.add_argument("--types", nargs="+", choices=sorted(TYPE_FLAGS), default=None,
+                   metavar="TYPE",
+                   help="only convert these slide types: tif svs qptiff kfbf "
+                        "(default: all found); skips the 'what to convert' menu")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="don't ask anything: convert every slide found with the defaults")
     p.add_argument("-o", "--output-dir", type=Path, default=None,
                    help="output directory (default: alongside the input)")
     p.add_argument("--compression", choices=["deflate", "lzw", "jpeg"], default=None,
@@ -2868,7 +3122,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "use if the slide's value is missing or wrong")
     p.add_argument("--overwrite", action="store_true", help="overwrite existing outputs")
     p.add_argument("--recursive", action="store_true",
-                   help="search sub-directories for .kfbf/.svs")
+                   help="also search sub-folders")
     p.add_argument("--workers", type=int, default=None,
                    help="tile decode threads (default: min(8, CPUs))")
     p.add_argument("--channel-names", nargs="+", default=None, metavar="NAME",
@@ -2913,10 +3167,42 @@ def _found_line(count: int, n_brightfield: int) -> str:
             f"brightfield (.svs) slide(s).")
 
 
-def confirm_brightfield(count: int) -> bool:
-    """Brightfield-only folder: one output type, so just confirm."""
-    print(_found_line(count, count))
-    print("Each one will be converted to an RGB pyramidal BigTIFF (<name>.tif).")
+def stdin_is_console() -> bool:
+    """True when a person can answer prompts (stdin is an interactive console)."""
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def _menu_choice(n: int) -> int | None:
+    """Ask for a number 1..n; Enter = 1. Returns the 0-based choice, or None
+    if cancelled (Ctrl+C, or input ran out after an invalid answer). Input
+    that ends before any answer (nobody at the keyboard) picks the default."""
+    attempted = False
+    while True:
+        try:
+            choice = _read_answer(f"Enter choice [1-{n}] (Press Enter for 1): ")
+        except EOFError:
+            print()
+            if attempted:  # input ran out after an invalid answer: don't guess
+                print("No valid choice entered; cancelled.")
+                return None
+            return 0  # non-interactive stdin with no answer: default
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            return None
+        attempted = True
+        if choice == "":
+            return 0
+        if choice.isdigit() and 1 <= int(choice) <= n:
+            return int(choice) - 1
+        print(f"Invalid choice, please enter a number from 1 to {n}.")
+
+
+def _confirm(found_line: str, what: str) -> bool:
+    print(found_line)
+    print(what)
     try:
         answer = _read_answer("Press Enter to start (or type q to cancel): ")
     except EOFError:
@@ -2931,38 +3217,67 @@ def confirm_brightfield(count: int) -> bool:
     return True
 
 
-def prompt_mode(count: int, n_brightfield: int = 0) -> str | None:
-    """Interactive output-format menu. Returns a mode, or None if cancelled.
+def confirm_brightfield(count: int) -> bool:
+    """Brightfield-only folder: one output type, so just confirm."""
+    return _confirm(_found_line(count, count),
+                    "Each one will be converted to an RGB pyramidal BigTIFF (<name>.tif).")
+
+
+_TYPE_RESULT = {
+    "TIFF": "a pyramidal BigTIFF (<name>.tif, or <name>.bigtiff.tif if that name is taken)",
+    "SVS": "an RGB pyramidal BigTIFF (<name>.tif)",
+    "QPTIFF": "a multi-channel pyramidal OME-TIFF (<name>.ome.tif)",
+}
+
+
+def confirm_type(input_type: str, count: int) -> bool:
+    """A folder with one slide type (not .kfbf): say what will happen, confirm."""
+    if input_type == "SVS":
+        return confirm_brightfield(count)
+    return _confirm(f"Found {count} {input_type} slide(s).",
+                    f"Each one will be converted to {_TYPE_RESULT.get(input_type, 'BigTIFF')}.")
+
+
+_TYPE_MENU = {"TIFF": "BigTIFF", "SVS": "BigTIFF", "QPTIFF": "OME-TIFF",
+              "KFBF": "choose the format next"}
+
+
+def prompt_types(counts: dict) -> list[str] | None:
+    """'What do you want to convert?' menu for a folder with several slide
+    types. ``counts`` = {input type: number of files}; only types found are
+    listed. Returns the chosen types, or None if cancelled."""
+    found = [t for t in INPUT_TYPES if counts.get(t)]
+    print("Found " + ", ".join(f"{counts[t]} {t}" for t in found) + " slide(s).")
+    print("What do you want to convert?")
+    print("  [1] Convert all (Default - press Enter)")
+    for i, t in enumerate(found, 2):
+        print(f"  [{i}] Only {t:<6} -> {_TYPE_MENU[t]}")
+    choice = _menu_choice(len(found) + 1)
+    if choice is None:
+        return None
+    return found if choice == 0 else [found[choice - 1]]
+
+
+def prompt_mode(count: int, n_brightfield: int = 0, header: str | None = None) -> str | None:
+    """Interactive output-format menu for .kfbf slides. Returns a mode, or
+    None if cancelled.
 
     ``count`` is the total number of slides, ``n_brightfield`` how many of
     them are brightfield (.svs); the menu applies to the fluorescence ones.
+    ``header`` replaces the "Found ..." line.
     """
-    print(_found_line(count, n_brightfield))
-    if n_brightfield:
-        print("Brightfield (.svs) slides are always converted to an RGB BigTIFF "
-              "(<name>.tif);\nthe format below applies to the fluorescence (.kfbf) slides.")
+    if header:
+        print(header)
+    else:
+        print(_found_line(count, n_brightfield))
+        if n_brightfield:
+            print("Brightfield (.svs) slides are always converted to an RGB BigTIFF "
+                  "(<name>.tif);\nthe format below applies to the fluorescence (.kfbf) slides.")
     print("Select output format:")
     for i, (_, label) in enumerate(_MENU, 1):
         print(f"  [{i}] {label}")
-    attempted = False
-    while True:
-        try:
-            choice = _read_answer("Enter choice [1-4] (Press Enter for 1): ")
-        except EOFError:
-            print()
-            if attempted:  # input ran out after an invalid answer: don't guess
-                print("No valid choice entered; cancelled.")
-                return None
-            return _MENU[0][0]  # non-interactive stdin with no answer: default
-        except KeyboardInterrupt:
-            print("\nCancelled.")
-            return None
-        attempted = True
-        if choice == "":
-            return _MENU[0][0]
-        if choice in {"1", "2", "3", "4"}:
-            return _MENU[int(choice) - 1][0]
-        print("Invalid choice, please enter a number from 1 to 4.")
+    choice = _menu_choice(len(_MENU))
+    return None if choice is None else _MENU[choice][0]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2987,50 +3302,74 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.error("require 0 <= --low-pct < --high-pct <= 100")
         return 2
 
-    interactive = args.input is None
-    if interactive:
+    no_arg = args.input is None
+    if no_arg:
         args.input = Path.cwd()
     try:
-        slides = find_slides(args.input, args.recursive)
+        found = discover_slides(args.input, args.recursive)
     except FileNotFoundError as exc:
         log.error("%s", exc)
         return 2
-    if interactive and not slides:
-        print(f"No .kfbf or .svs files found in the current folder ({args.input}).")
-        return 0
-    if interactive and args.mode is None and not args.info:
-        n_bf = sum(slide_kind_by_suffix(s) == "brightfield" for s in slides)
-        if n_bf == len(slides):
-            if not confirm_brightfield(len(slides)):
-                return 130
-        else:
-            args.mode = prompt_mode(len(slides), n_bf)
-            if args.mode is None:
-                return 130
-    if not slides:
-        log.error("no .kfbf or .svs files found in %s", args.input)
+    if args.types:
+        wanted = {TYPE_FLAGS[t] for t in args.types}
+        found = [(p, t) for p, t in found if t in wanted]
+    if not found:
+        if no_arg:
+            print(f"No {SUPPORTED_TEXT} files found in the current folder ({args.input}).")
+            return 0
+        log.error("no %s files found in %s", SUPPORTED_TEXT, args.input)
         return 1
+
+    # Ask what to convert when a person is there: always for the current
+    # folder (no argument), and for a folder passed on the command line or
+    # dropped on run_converter.bat when stdin is an interactive console.
+    ask = (not args.yes and not args.info and args.input.is_dir()
+           and (no_arg or stdin_is_console()))
+    if ask:
+        types = [t for t in INPUT_TYPES if any(ft == t for _, ft in found)]
+        menu_shown = False
+        if len(types) > 1 and not args.types:
+            chosen = prompt_types(Counter(t for _, t in found))
+            if chosen is None:
+                return 130
+            found = [(p, t) for p, t in found if t in chosen]
+            types, menu_shown = [t for t in types if t in chosen], True
+        if args.mode is None:
+            n_kfbf = sum(t == "KFBF" for _, t in found)
+            if "KFBF" in types:
+                header = None if len(types) == 1 and not menu_shown else \
+                    f"Output format for the {n_kfbf} KFBF slide(s):"
+                args.mode = prompt_mode(n_kfbf, header=header)
+                if args.mode is None:
+                    return 130
+            elif len(types) == 1 and not menu_shown:
+                if not confirm_type(types[0], len(found)):
+                    return 130
 
     if args.info:
         rc = 0
-        for s in slides:
+        for s, _ in found:
             try:
                 with open_slide(s, mpp_fallback=args.mpp, channel_names=args.channel_names,
                                 magnification=args.magnification) as slide:
                     print(slide.summary(args.min_level_size, args.max_levels), end="\n\n")
             except Exception as exc:
-                log.error("%s: %s", s.name, exc)
+                log.error("%s", _plain_error(s, exc))
                 rc = 1
         return rc
 
     failures: list[tuple[Path, str]] = []
+    stats = {t: Counter() for t in INPUT_TYPES + ("?",)}
     n_written = 0
-    for s in tqdm(slides, desc="Slides", unit="slide", disable=args.quiet or len(slides) < 2,
-                  dynamic_ncols=True):
+    for s, itype in tqdm(found, desc="Slides", unit="slide",
+                         disable=args.quiet or len(found) < 2, dynamic_ncols=True):
         out_dir = args.output_dir or s.parent
         output_errors: list = []
+        skipped: list = []
+        written: list = []
+        failed = False
         try:
-            n_written += len(convert_slide(
+            written = convert_slide(
                 s, out_dir, mode=args.mode, compression=args.compression,
                 tile_size=args.tile_size, mpp=args.mpp, overwrite=args.overwrite,
                 workers=args.workers, channel_names=args.channel_names,
@@ -3038,7 +3377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 jpeg_quality=args.jpeg_quality, show_progress=not args.quiet,
                 min_level_size=args.min_level_size, max_levels=args.max_levels,
                 preflight=not args.no_preflight, errors=output_errors,
-                magnification=args.magnification))
+                magnification=args.magnification, skipped=skipped)
         except KeyboardInterrupt:
             log.error("interrupted")
             return 130
@@ -3047,19 +3386,47 @@ def main(argv: Sequence[str] | None = None) -> int:
             log.debug("traceback", exc_info=True)
             failures.append((s, exc.lines()[0] if isinstance(exc, VerificationError)
                              else f"{exc.HEADLINE} {exc.reason}"))
+            failed = True
+        except SlideFormatError as exc:  # unreadable / unsupported / damaged input
+            log.error("%s", _plain_error(s, exc))
+            log.debug("traceback", exc_info=True)
+            failures.append((s, _plain_error(s, exc, with_name=False)))
+            failed = True
         except Exception as exc:
             log.error("%s: conversion failed: %s", s.name, exc,
                       exc_info=args.verbose)
             failures.append((s, str(exc)))
+            failed = True
         for out, exc in output_errors:
             failures.append((out, str(exc) if isinstance(exc, VerificationError)
                              else f"{exc.HEADLINE} {exc.reason}"))
+        n_written += len(written)
+        status = ("failed" if failed or output_errors else
+                  "converted" if written else "skipped")
+        stats[itype if itype in stats else "?"][status] += 1
 
     log.info("done: %d slide(s), %d file(s) written, %d failure(s)",
-             len(slides), n_written, len(failures))
+             len(found), n_written, len(failures))
+    total = sum(stats.values(), Counter())
+    log.info("Converted %d, skipped %d (already done), failed %d",
+             total["converted"], total["skipped"], total["failed"])
+    if sum(1 for c in stats.values() if c) > 1:
+        for t, c in stats.items():
+            if c:
+                log.info("  %-6s: converted %d, skipped %d (already done), failed %d",
+                         t, c["converted"], c["skipped"], c["failed"])
     for s, msg in failures:
         log.info("  FAILED %s: %s", s, msg)
     return 1 if failures else 0
+
+
+def _plain_error(path: Path, exc: Exception, with_name: bool = True) -> str:
+    """'<name>: <message>' without repeating the name the message starts with."""
+    msg = str(exc)
+    prefix = f"{path.name}: "
+    if msg.startswith(prefix):
+        msg = msg[len(prefix):]
+    return f"{path.name}: {msg}" if with_name else msg
 
 
 if __name__ == "__main__":
