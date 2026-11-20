@@ -378,7 +378,8 @@ def test_type_menu_lists_found_types_and_enter_converts_all(three_types, monkeyp
     rc, asked = _run(monkeypatch, [str(three_types), "-q"], [""], console=True)
     assert rc == 0
     out = capsys.readouterr().out
-    assert out.startswith("Found 2 TIFF, 1 SVS, 1 QPTIFF slide(s).\n"
+    assert out.startswith(kc.MENU_BANNER + "\n"
+                          "Found 2 TIFF, 1 SVS, 1 QPTIFF slide(s).\n"
                           "What do you want to convert?\n"
                           "  [1] Convert all (Default - press Enter)\n"
                           "  [2] Only TIFF   -> BigTIFF\n"
@@ -438,7 +439,8 @@ def test_single_type_folder_skips_menu_but_confirms(tmp_path, monkeypatch, capsy
     rc, asked = _run(monkeypatch, ["-q"], [""])
     out = capsys.readouterr().out
     assert rc == 0 and len(asked) == 1
-    assert out.startswith("Found 1 QPTIFF slide(s).\nEach one will be converted to a "
+    assert out.startswith(kc.MENU_BANNER + "\n"
+                          "Found 1 QPTIFF slide(s).\nEach one will be converted to a "
                           "multi-channel pyramidal OME-TIFF (<name>.ome.tif).\n")
     assert "What do you want to convert?" not in out
     assert (tmp_path / "q.ome.tif").exists()

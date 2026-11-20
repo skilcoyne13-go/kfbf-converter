@@ -3,6 +3,7 @@
 import builtins
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -183,6 +184,40 @@ def test_info_both_types(mixed_dir, capsys):
     assert "MPP           : 0.5 um/px" in text
 
 
+def test_version_output(capsys):
+    with pytest.raises(SystemExit) as ei:
+        kc.main(["--version"])
+    assert ei.value.code == 0
+    assert capsys.readouterr().out.strip() == (
+        f"kfbf_converter {kc.__version__} - {kc.__author__}, {kc.__company__}")
+
+
+def test_bat_window_title_and_crlf():
+    bat = (Path(kc.__file__).parent / "run_converter.bat").read_bytes()
+    assert f"\r\ntitle KFBio Slide Converter - {kc.__company__}\r\n".encode() in bat
+    assert bat.count(b"\n") == bat.count(b"\r\n")          # CRLF only
+
+
+def test_artist_and_software_tags_on_every_output(kfbf, svs, tmp_path):
+    from conftest import make_qptiff, make_tiff
+    out = _out(tmp_path)
+    q = make_qptiff(tmp_path / "q.qptiff")
+    make_tiff(tmp_path / "photo.tif")
+    written = (kc.convert_slide(kfbf.path, out, mode="all", show_progress=False)
+               + kc.convert_slide(svs.path, out, show_progress=False)
+               + kc.convert_slide(svs.path, out / "re", compression="deflate",
+                                  show_progress=False)
+               + kc.convert_slide(q.path, out, show_progress=False)
+               + kc.convert_slide(tmp_path / "photo.tif", out, show_progress=False))
+    assert len(written) == 9
+    for p in written:
+        with tifffile.TiffFile(p) as t:
+            tags = t.pages[0].tags
+            assert tags["Artist"].value == f"{kc.__author__}, {kc.__company__}", p.name
+            assert tags["Software"].value.startswith("kfbf_converter "), p.name
+        assert kc.own_output_reason(p) is not None, p.name     # still skipped as ours
+
+
 def test_unknown_file_is_a_clear_error(tmp_path, capsys):
     bad = tmp_path / "x.dat"
     bad.write_bytes(b"nope" * 10)
@@ -215,7 +250,7 @@ def test_menu_fluorescence_only_unchanged(tmp_path, monkeypatch, capsys):
     make_kfbf(tmp_path / "a.kfbf")
     assert _interactive(monkeypatch, tmp_path, ["1"]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("Found 1 slide(s).\n" + MENU)
+    assert out.startswith(kc.MENU_BANNER + "\nFound 1 slide(s).\n" + MENU)
     assert (tmp_path / "a.ome.tif").exists()
 
 
@@ -223,7 +258,8 @@ def test_menu_mixed_counts(mixed_dir, monkeypatch, capsys):
     # several types: first "what to convert" (Enter = all), then the .kfbf format
     assert _interactive(monkeypatch, mixed_dir, ["", "2"]) == 0
     out = capsys.readouterr().out
-    assert out.startswith("Found 1 SVS, 1 KFBF slide(s).\n"
+    assert out.startswith(kc.MENU_BANNER + "\n"
+                          "Found 1 SVS, 1 KFBF slide(s).\n"
                           "What do you want to convert?\n"
                           "  [1] Convert all (Default - press Enter)\n"
                           "  [2] Only SVS    -> BigTIFF\n"
@@ -236,7 +272,7 @@ def test_menu_brightfield_only_confirm(tmp_path, monkeypatch, capsys):
     make_svs(tmp_path / "b.svs")
     assert _interactive(monkeypatch, tmp_path, ["q"]) == 130
     out = capsys.readouterr().out
-    assert out.startswith("Found 1 brightfield (.svs) slide(s).\n")
+    assert out.startswith(kc.MENU_BANNER + "\nFound 1 brightfield (.svs) slide(s).\n")
     assert "Select output format" not in out
     assert not (tmp_path / "b.tif").exists()
     assert _interactive(monkeypatch, tmp_path, [""]) == 0

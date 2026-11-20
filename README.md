@@ -1,5 +1,7 @@
 # kfbf-converter — Pure-Python Slide Converter
 
+Created by Scott Kilcoyne · DigitCells
+
 ## Overview
 
 **kfbf-converter** is a fast, low-memory converter for computational pathology. It
@@ -622,3 +624,11 @@ on Windows and `/proc/self/mounts` on Linux; on macOS it isn't detected, but
 the free-space check still runs.
 
 </details>
+
+---
+
+## About
+
+kfbf-converter was created by Scott Kilcoyne and made possible by DigitCells.
+
+Copyright (c) 2026 DigitCells

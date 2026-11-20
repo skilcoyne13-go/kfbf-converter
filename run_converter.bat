@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title KFBio Slide Converter
+title KFBio Slide Converter - DigitCells
 
 python --version >nul 2>&1
 if errorlevel 1 (

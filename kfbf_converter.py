@@ -4,6 +4,9 @@ kfbf_converter.py - Convert whole-slide images (KFBio .kfbf, Aperio .svs,
 PerkinElmer/Akoya .qptiff and plain .tif/.tiff) into open, QuPath-ready
 pyramidal formats.
 
+Created by Scott Kilcoyne, DigitCells.
+Copyright (c) 2026 DigitCells
+
 Inputs and what each becomes
 ----------------------------
 .kfbf       KFBio fluorescence slide      -> OME-TIFF / RGB / split (see modes)
@@ -93,6 +96,11 @@ except ImportError:  # pragma: no cover
     Image = None
 
 __version__ = "1.1.0"
+__author__ = "Scott Kilcoyne"
+__company__ = "DigitCells"
+
+CREDIT = f"{__author__}, {__company__}"           # TIFF Artist tag, --version
+MENU_BANNER = f"KFBio Slide Converter - {__company__}"
 
 log = logging.getLogger("kfbf_converter")
 
@@ -2092,10 +2100,12 @@ class _PyramidWriter:
                         # files (1 = label, 9 = macro for SVS readers)
                         if lv is levels[0]:
                             kw["software"] = f"kfbf_converter {__version__}"
+                            kw["extratags"] = [(315, "s", 0, CREDIT, True)]  # Artist
                     elif lv is levels[0]:
                         kw["subifds"] = len(levels) - 1
                         kw["metadata"] = metadata
                         kw["software"] = f"kfbf_converter {__version__}"
+                        kw["extratags"] = [(315, "s", 0, CREDIT, True)]  # Artist
                     else:
                         kw["subfiletype"] = 1
                         kw["metadata"] = None
@@ -3139,7 +3149,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--info", action="store_true", help="print parsed slide structure and exit")
     p.add_argument("-q", "--quiet", action="store_true", help="hide progress bars")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
-    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__} - {CREDIT}")
     return p
 
 
@@ -3328,6 +3338,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if ask:
         types = [t for t in INPUT_TYPES if any(ft == t for _, ft in found)]
         menu_shown = False
+        if (len(types) > 1 and not args.types) or (
+                args.mode is None and ("KFBF" in types or len(types) == 1)):
+            print(MENU_BANNER)  # only when a question follows
         if len(types) > 1 and not args.types:
             chosen = prompt_types(Counter(t for _, t in found))
             if chosen is None:
