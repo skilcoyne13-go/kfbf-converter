@@ -1,27 +1,33 @@
-# kfbf-converter — Pure-Python KFBio Slide Converter
+# kfbf-converter — Pure-Python Slide Converter
 
 ## Overview
 
 **kfbf-converter** is a fast, low-memory converter for computational pathology. It
-turns **KFBio whole-slide scans** into QuPath-ready open formats:
+turns **whole-slide scans** into QuPath-ready open formats:
 
-- **fluorescence** scans (`.kfbf`, proprietary) into multi-channel **OME-TIFFs**
-  and standard **BigTIFFs**
+- **KFBio fluorescence** scans (`.kfbf`, proprietary) into multi-channel
+  **OME-TIFFs** and standard **BigTIFFs**
+- **QPTIFF** scans (`.qptiff`, PerkinElmer / Akoya, and KFBio scanners that
+  write them) into multi-channel **OME-TIFFs**
 - **brightfield** scans (`.svs`, as written by KFBio scanners) into an
   **RGB pyramidal BigTIFF** with standard pixel-size tags
+- plain **TIFF** images (`.tif` / `.tiff`) into a **pyramidal BigTIFF**
 
 QuPath, Bio-Formats, napari, OMERO and most other image-analysis tools can open
 the results.
 
 ### Supported inputs
 
-| Scan | Input file | Outputs |
+| Scan | Input file | Becomes |
 |---|---|---|
-| Fluorescence | `.kfbf` | OME-TIFF (default), composite RGB BigTIFF, split grayscale BigTIFFs |
+| KFBio fluorescence | `.kfbf` | OME-TIFF (default), composite RGB BigTIFF, split grayscale BigTIFFs |
+| QPTIFF (PerkinElmer / Akoya) | `.qptiff` | multi-channel pyramidal OME-TIFF (`<name>.ome.tif`); an RGB (brightfield) QPTIFF becomes an RGB BigTIFF (`<name>.tif`) |
 | Brightfield | `.svs` | RGB pyramidal BigTIFF (`<name>.tif`) |
+| Plain TIFF | `.tif`, `.tiff` | pyramidal BigTIFF, RGB or grayscale (`<name>.tif`, or `<name>.bigtiff.tif` if that name is taken) |
 
-The scanner also writes QPTIFF for fluorescence itself, so that is not offered here.
-Older KFBio `.kfb` files are not supported.
+Older KFBio `.kfb` files are not supported. Multi-channel plain TIFFs (one
+image per channel) are not supported either; only RGB or single-channel
+grayscale TIFFs.
 
 ## Key Features
 
@@ -37,6 +43,14 @@ Older KFBio `.kfb` files are not supported.
 - **Brightfield RGB BigTIFF** (`.tif`) from `.svs`: the scanner's JPEG tiles are
   copied unchanged, so there is **no extra quality loss** and the file is about
   the size of the original (e.g. 94 MB `.svs` → 91 MB `.tif` in under a second).
+- **QPTIFF to OME-TIFF**: every channel with its real name and colour, the
+  pixel size and the objective magnification, at its original bit depth (8- or
+  16-bit). 8-bit JPEG tiles are copied unchanged (e.g. a 571 MB, 4-channel
+  71 960 × 77 588 px QPTIFF → 564 MB OME-TIFF in 12 s). The thumbnail,
+  overview and label images are left out.
+- **Plain TIFF to pyramidal BigTIFF**: RGB or grayscale `.tif`/`.tiff` images
+  (even huge single-resolution ones) get a full pyramid, so they open and zoom
+  quickly in QuPath. Damaged or incomplete TIFFs are reported and skipped.
 - **Clear size errors**: before writing, every output is checked against the
   file format, the destination drive (e.g. FAT32's 4 GB file limit) and the
   free space. If it can't fit, you get
@@ -49,9 +63,9 @@ Older KFBio `.kfb` files are not supported.
   image never has to fit in memory. A 20 000 × 12 000 px, 3-channel slide converts
   to every format using about 300 MB of RAM, a 44 000 × 47 000 px one to
   OME-TIFF using about 370 MB.
-- **Batch mode and interactive menu**: point it at a folder to convert every
-  slide (fluorescence and brightfield can be mixed), or just run it and pick a
-  format.
+- **Batch mode and interactive menu**: point it at a folder (or drop one on
+  `run_converter.bat`). It counts each slide type it finds, asks what to
+  convert, and never mistakes its own output files for new slides.
 
 Every output is a tiled, pyramidal file. It holds the full resolution plus
 downsampled levels, so it opens and zooms instantly in QuPath. The objective
@@ -69,12 +83,26 @@ than a zoom factor.
    pip install -r requirements.txt
    ```
 3. **Copy both `kfbf_converter.py` and `run_converter.bat`** into the folder
-   that contains your `.kfbf` and/or `.svs` files. The launcher looks for the
-   script next to itself, so the two files must stay together.
-4. **Double-click `run_converter.bat`** (or run `python kfbf_converter.py` in
-   that folder). You will see:
+   that contains your slides (`.tif`/`.tiff`, `.svs`, `.qptiff`, `.kfbf`). The
+   launcher looks for the script next to itself, so the two files must stay
+   together. *Or* keep them anywhere and **drag your slide folder onto
+   `run_converter.bat`**.
+4. **Double-click `run_converter.bat`**. It counts the slides and asks what to
+   convert:
    ```text
-   Found 3 slide(s).
+   Found 12 TIFF, 3 SVS, 3 QPTIFF, 2 KFBF slide(s).
+   What do you want to convert?
+     [1] Convert all (Default - press Enter)
+     [2] Only TIFF   -> BigTIFF
+     [3] Only SVS    -> BigTIFF
+     [4] Only QPTIFF -> OME-TIFF
+     [5] Only KFBF   -> choose the format next
+   Enter choice [1-5] (Press Enter for 1):
+   ```
+   Only the types in your folder are listed. **Press Enter** to convert
+   everything. If there are `.kfbf` slides, you then pick their format:
+   ```text
+   Output format for the 2 KFBF slide(s):
    Select output format:
      [1] OME-TIFF (Default / QuPath)
      [2] Composite RGB BigTIFF
@@ -82,15 +110,14 @@ than a zoom factor.
      [4] All of the above
    Enter choice [1-4] (Press Enter for 1):
    ```
-   If the folder also has brightfield slides, the first line shows both counts,
-   e.g. `Found 3 fluorescence (.kfbf) and 2 brightfield (.svs) slide(s).` The
-   format you pick applies to the fluorescence slides; brightfield slides always
-   become an RGB BigTIFF. A folder with only brightfield slides skips the menu
-   and just asks you to press Enter to start.
-5. **Press Enter** to choose the default QuPath OME-TIFF mode.
+   If the folder has only one type of slide, the first menu is skipped.
+5. **Wait for the summary** at the end, e.g.
+   `Converted 15, skipped 2 (already done), failed 1`, with a line per slide
+   type and the reason for each failure.
 
 The converted files appear next to your slides. Existing outputs are skipped,
-so running it again only converts new slides.
+so running it again only converts new slides. The converter never treats its
+own output files as new slides.
 
 If a slide is too big for the drive you're saving to, you'll see
 `Data is too big for the file format chosen.` followed by what to do (see
@@ -104,13 +131,22 @@ If a slide is too big for the drive you're saving to, you'll see
 ```bash
 python kfbf_converter.py slide.kfbf --mode ome
 python kfbf_converter.py slide.svs
+python kfbf_converter.py slide.qptiff
+python kfbf_converter.py image.tiff
 ```
 
-**Entire folder (batch)**: `.kfbf` and `.svs` can be mixed; each slide gets
-the output that fits its type
+**Entire folder (batch)**: all types can be mixed; each slide gets the output
+that fits its type. In a console window you get the "what to convert" menu;
+`--types` picks types without it, and `--yes` converts everything without
+asking:
 ```bash
-python kfbf_converter.py "C:\path\to\slides" --mode all -o "C:\path\to\output"
+python kfbf_converter.py "C:\path\to\slides" -o "C:\path\to\output"
+python kfbf_converter.py "C:\path\to\slides" --types qptiff tif
+python kfbf_converter.py "C:\path\to\slides" --yes --mode all
 ```
+When nobody is at the keyboard (a script, a scheduled task, input piped in),
+everything found is converted with the defaults and nothing waits for an
+answer.
 
 **Inspect a slide** (dimensions, magnification, pixel size, channels, pyramid
 levels), without converting it:
@@ -153,15 +189,62 @@ tiles are decoded and re-encoded instead. On the 94 MB KFBio sample this gave:
 The scanner already saves brightfield tiles as JPEG (quality 30), so the default
 copy is both the smallest and the most faithful option.
 
+### QPTIFF output (`.qptiff`)
+
+Each fluorescence `.qptiff` gives one `slide.ome.tif`: a multi-channel
+pyramidal OME-TIFF. The converter reads the XML that the scanner stores with
+every image:
+
+- **channels**: name from `<Biomarker>` (or `<Name>`), colour from `<Color>`
+- **objective magnification** from `<Objective>` (e.g. `40x`)
+- **pixel size** from the XML, or else the TIFF resolution tags
+
+Pages marked `Thumbnail`, `Overview`, `Label` or `Macro` are not copied. The
+bit depth is kept: 16-bit QPTIFFs stay 16-bit (JPEG can't hold 16-bit, so
+`--compression jpeg` is refused for them).
+
+By default, 8-bit JPEG tiles are **copied unchanged**, like `.svs`. Some
+QPTIFFs store lower pyramid levels at slightly wrong sizes (a KFBio file had
+one level 81 rows short); from the first such level down, the converter
+computes the levels itself from the last correct one and says so in the log.
+A brightfield (RGB) QPTIFF becomes an RGB BigTIFF (`slide.tif`) instead, and
+the log says so. A file that tifffile identifies as QPTIFF is read as one
+whatever its extension.
+
+### TIFF output (`.tif` / `.tiff`)
+
+Each plain TIFF gives one pyramidal BigTIFF in the same layout as the `.svs`
+output: RGB for colour images, grayscale (8- or 16-bit) for single-channel
+ones. The pixel size and an `AppMag` magnification are kept if the file has
+them; otherwise `--mpp` / `--magnification` are used. A TIFF that is already
+pyramidal is still rewritten (it may lack levels or metadata), and the log
+says so.
+
+**Output name**: `image.tif`, unless that would clash, in which case it's
+`image.bigtiff.tif`. That happens when the input is itself `image.tif`, when
+another program's `image.tif` is already there, or when an `image.svs` or
+`image.qptiff` sits next to it. An input is never overwritten.
+
+**Files the converter never treats as new slides**: names ending in
+`.ome.tif`, `.rgb.tif`, `.bigtiff.tif` or `.part`; `<name>_<channel>.tif` next
+to `<name>.kfbf`; `<name>.tif` next to `<name>.svs`; and any TIFF whose
+Software tag starts with `kfbf_converter` (so renamed outputs are caught too).
+
+A damaged TIFF (truncated, corrupt, or a scanner file over 4 GB saved as
+classic TIFF) is reported as `<name>: this TIFF is damaged or incomplete and
+cannot be converted`, and the rest of the batch continues.
+
 ### Common options
 
 | Option | Default | What it does |
 |---|---|---|
 | `-o, --output-dir` | next to the input | Where to save the converted files |
-| `--compression` | `deflate` (`.svs`: copy tiles) | `deflate` or `lzw` (lossless), or `jpeg` (smaller, lossy) |
+| `--types` | all found | Only convert these types: `tif`, `svs`, `qptiff`, `kfbf` (no menu) |
+| `-y, --yes` | off | Don't ask anything; convert everything found with the defaults |
+| `--compression` | `deflate` (`.svs`, 8-bit `.qptiff`: copy tiles) | `deflate` or `lzw` (lossless), or `jpeg` (smaller, lossy) |
 | `--overwrite` | off | Replace files that already exist |
 | `--recursive` | off | Also convert slides in sub-folders |
-| `--channel-names` | from slide | Rename the channels, e.g. `--channel-names DAPI CD3 CD8` (fluorescence only) |
+| `--channel-names` | from slide | Rename the channels, e.g. `--channel-names DAPI CD3 CD8` (`.kfbf` and `.qptiff`) |
 | `--mpp` | `0.2528` | Pixel size (µm/px), used only if the slide doesn't contain one |
 | `--magnification` | from slide | Objective magnification (e.g. `40`), if the slide's value is missing or wrong |
 | `--tile-size` | `512` (`.svs` tile copy: `256`) | Output tile size in pixels |
@@ -175,7 +258,8 @@ Run `python kfbf_converter.py --help` for the full list.
 ### Magnification
 
 The objective magnification is read from the slide (`.kfbf` header,
-`.svs` `AppMag`) and written into every output. `--info` shows it, e.g.
+`.svs` `AppMag`, `.qptiff` `<Objective>`, a TIFF's `AppMag` if present) and
+written into every output. `--info` shows it, e.g.
 `Magnification : 40x (header)`. If it's missing or wrong, set it with
 `--magnification 40`.
 
@@ -251,6 +335,25 @@ verified.
    should show **40.0x** instead of "1.0x". *This was checked against the OME
    schema, but not yet in QuPath itself.*
 
+**QPTIFF (`.ome.tif` from `.qptiff`)**
+
+1. **Drag and drop** the `.ome.tif` into QuPath and choose **Fluorescence**
+   if asked.
+2. In the **Image** tab, check that:
+   - **Width** and **Height** match `--info` on the `.qptiff`
+   - **Pixel width** and **Pixel height** match its `MPP` (e.g. 0.125 µm)
+   - **Magnification** matches its `Magnification` (e.g. 40)
+   - **Bit depth** is 8 (or 16 for a 16-bit QPTIFF)
+3. Open **Brightness & Contrast** (**Shift + C**): the channel names (e.g.
+   DAPI, Aqua480, Green520, Orange570) and colours should match the scanner's.
+4. Zoom out all the way and back in: it should stay smooth (all pyramid
+   levels load), and at full resolution the toolbar should show **40.0x**.
+5. Compare with the `.qptiff` opened directly in QuPath if you can: the image
+   should look the same.
+
+*Checked against the OME schema and by reading the file back with tifffile, but
+not yet in QuPath itself.*
+
 **Brightfield (`.tif` from `.svs`)**
 
 1. **Drag and drop** the `.tif` into QuPath.
@@ -275,11 +378,17 @@ used (**Image** tab → **Server type**) and share it.
 |---|---|
 | `Python is not installed or not in PATH` | Reinstall Python and tick **Add Python to PATH** |
 | `No module named ...` | Run `pip install -r requirements.txt` |
-| `No .kfbf or .svs files found` | Put the slides in the same folder you run the converter from |
+| `No .tif/.tiff, .svs, .qptiff or .kfbf files found` | Put the slides in the same folder you run the converter from, or drag the folder onto `run_converter.bat` |
+| The "What do you want to convert?" menu doesn't appear | It only appears when the folder has more than one slide type and someone is at the keyboard. To choose types without it, use `--types` |
+| `this TIFF is damaged or incomplete and cannot be converted` | The file is truncated or corrupt (e.g. a copy that didn't finish, or a scanner TIFF over 4 GB saved as classic TIFF). Copy or export it again; the other slides still convert |
+| `this TIFF holds N images per level` | Multi-channel plain TIFFs aren't supported; only RGB or single-channel grayscale |
+| An output is called `<name>.bigtiff.tif` | `<name>.tif` was taken (often by the input itself), so the converter chose a name that can't overwrite it |
+| `stored level ... is not an exact 2x step` | Information only: the file's own lower levels have odd sizes, so the converter computes them instead |
+| `16-bit pixels, which JPEG cannot store` | Leave out `--compression jpeg` (or use `deflate` / `lzw`) for 16-bit QPTIFFs and TIFFs |
 | `Data is too big for the file format chosen.` | Follow the **Fix:** line under it. Usually: save to an NTFS or exFAT drive with `-o` (FAT32 USB sticks can't hold files over 4 GB), free up disk space, or use `--compression jpeg` for a smaller file. If you're sure it fits, try `--no-preflight` |
 | `Output failed verification and was deleted: ...` | The written file didn't read back correctly and was removed. Check the drive (try another one with `-o`), then run again with `-v` and share the output |
-| `unrecognised slide file` | Only KFBio `.kfbf` (fluorescence) and Aperio `.svs` (brightfield) slides are supported; older `.kfb` files are not |
-| `already converted by kfbf_converter` | That file is an output of this tool; convert the original `.svs` / `.kfbf` instead |
+| `unrecognised slide file` | Supported: `.tif`/`.tiff`, `.svs`, `.qptiff` and `.kfbf`; older KFBio `.kfb` files are not |
+| `already converted by kfbf_converter` | That file is an output of this tool; convert the original slide instead |
 | QuPath shows a zoom like "1.33x" instead of "40.0x" | Check `--info`: if it says `Magnification : unknown`, convert again with `--magnification 40` (and `--overwrite`) |
 | Wrong or generic channel names | Set them with `--channel-names` |
 | Image looks scrambled or wrong | Run `--info` on the slide and share the output |
@@ -447,7 +556,9 @@ written = convert_slide("slide.kfbf", "output/", mode="all", compression="deflat
 from kfbf_converter import open_slide, SVSSlide, convert_slide
 
 # open_slide picks the reader by magic bytes first, file extension second:
-# KFBioSlide for .kfbf, SVSSlide for .svs. Unknown files raise SlideFormatError.
+# KFBioSlide for .kfbf, SVSSlide for .svs, QPTIFFSlide for anything tifffile
+# identifies as QPTIFF, TiffSlide for other .tif/.tiff. Unknown files raise
+# SlideFormatError.
 with open_slide("slide.svs") as slide:          # -> SVSSlide
     print(slide.summary())                       # same text as --info
     print(slide.kind, slide.is_rgb, slide.n_channels, slide.mpp)  # brightfield True 3 0.485896
@@ -462,11 +573,24 @@ with open_slide("slide.svs") as slide:          # -> SVSSlide
 # tile_size unset to copy the original JPEG tiles, or set them to re-encode.
 convert_slide("slide.svs", "output/")
 convert_slide("slide.svs", "output/", compression="jpeg")
+
+# QPTIFF: like KFBioSlide (channel_names, channel_colors, read_region(..., channel)),
+# plus slide.dtype (uint8 or uint16). Always writes <stem>.ome.tif.
+with open_slide("slide.qptiff") as slide:       # -> QPTIFFSlide
+    dapi = slide.read_region(level=3, x=0, y=0, width=512, height=512, channel=0)
+convert_slide("slide.qptiff", "output/")
+
+# Folder scan: [(path, "TIFF" | "SVS" | "QPTIFF" | "KFBF")], our outputs left out
+from pathlib import Path
+from kfbf_converter import discover_slides
+for path, kind in discover_slides(Path("slides")):
+    print(kind, path.name)
 ```
 
 `convert_slide` also takes `magnification=None` (overrides the slide's
 objective magnification, like `--magnification`), `preflight=True` (set it
-to `False` to skip the size check) and `errors=None`. Readers and
+to `False` to skip the size check), `errors=None` and `skipped=None` (a list
+that collects outputs skipped because they already exist). Readers and
 `open_slide` accept `magnification=` too; `slide.magnification` is the
 value used (0 = unknown) and `slide.magnification_source` says where it came
 from (`header`, `Aperio AppMag`, `--magnification` or `missing`). By default a refused or unverifiable output raises
