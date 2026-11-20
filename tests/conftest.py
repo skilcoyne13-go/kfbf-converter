@@ -282,3 +282,119 @@ def tiff_levels(path: Path) -> dict:
                     levels=levels,
                     arrays=[lv.asarray() for lv in t.series[0].levels],
                     n_series_levels=len(t.series[0].levels))
+
+
+# --------------------------------------------------------------------------
+# .qptiff (PerkinElmer / Akoya) and plain .tif
+# --------------------------------------------------------------------------
+
+def qpi_description(image_type: str, name: str | None = None, color=None,
+                    objective: str = "20x", biomarker: str | None = None) -> str:
+    """Per-page XML like a Vectra Polaris / KFBio QPTIFF."""
+    parts = ['<?xml version="1.0" encoding="utf-16"?>',
+             "<PerkinElmer-QPI-ImageDescription>",
+             "  <DescriptionVersion>2</DescriptionVersion>",
+             "  <AcquisitionSoftware>Synthetic 1.0</AcquisitionSoftware>",
+             f"  <ImageType>{image_type}</ImageType>",
+             f"  <Objective>{objective}</Objective>"]
+    if name is not None:
+        parts.append(f"  <Name>{name}</Name>")
+        if biomarker:
+            parts.append(f"  <Biomarker>{biomarker}</Biomarker>")
+        parts.append(f"  <Color>{','.join(map(str, color))}</Color>")
+        parts += ["  <Responsivity>", "    <Filter>",           # nested Name: ignored
+                  f"      <Name>filter-{name}</Name>", "    </Filter>", "  </Responsivity>"]
+    parts.append("</PerkinElmer-QPI-ImageDescription>")
+    return "\r\n".join(parts)
+
+
+@dataclass
+class QptiffInfo:
+    path: Path
+    width: int
+    height: int
+    channels: list[str]
+    colors: list[tuple[int, int, int]]
+    mpp: float
+    level_sizes: list[tuple[int, int]]   # stored pyramid levels (w, h)
+    planes: dict = field(default_factory=dict)  # (level, ch) -> stored array
+
+
+QPTIFF_CHANNELS = (("DAPI", (0, 0, 255)), ("Opal 520", (0, 255, 0)),
+                   ("Opal 690", (255, 0, 0)))
+
+
+def make_qptiff(path: Path, width: int = 1300, height: int = 1000, channels=QPTIFF_CHANNELS,
+                n_levels: int = 3, dtype=np.uint8, mpp: float = 0.4977,
+                objective: str = "20x", bad_last: bool = False, rgb: bool = False,
+                biomarkers: bool = False) -> QptiffInfo:
+    """Write a synthetic QPTIFF: per channel a FullResolution page, an RGB
+    Thumbnail page, ReducedResolution pages per level, then Overview and
+    Label. 8-bit planes are JPEG tiles, 16-bit ones deflate. ``bad_last``
+    stores the last level 40 rows short (not an exact 2x step)."""
+    dtype = np.dtype(dtype)
+    chans = [("RGB", (0, 0, 0))] if rgb else list(channels)
+    info = QptiffInfo(path, width, height, [c for c, _ in chans], [c for _, c in chans],
+                      mpp, [])
+    res = 1e4 / mpp
+    if rgb:
+        comp = dict(compression="jpeg", compressionargs={"level": 90}, photometric="rgb")
+    elif dtype == np.uint8:
+        comp = dict(compression="jpeg", compressionargs={"level": 95}, photometric="minisblack")
+    else:
+        comp = dict(compression="zlib", photometric="minisblack")
+    sizes, w, h = [], width, height
+    for li in range(n_levels):
+        sizes.append((w, h))
+        w, h = math.ceil(w / 2), math.ceil(h / 2)
+    if bad_last and n_levels > 1:
+        sizes[-1] = (sizes[-1][0], sizes[-1][1] - 40)
+    info.level_sizes = sizes
+    with tifffile.TiffWriter(path, bigtiff=True) as t:
+        def page(arr, desc, subfiletype=0, tiled=True, kw=comp, r=res):
+            t.write(arr, tile=(TS, TS) if tiled else None, description=desc,
+                    software="PerkinElmer-QPI", metadata=None, subfiletype=subfiletype,
+                    resolution=(r, r), resolutionunit="CENTIMETER", **kw)
+
+        for li, (lw, lh) in enumerate(sizes):
+            for ci, (name, color) in enumerate(chans):
+                if rgb:
+                    arr = _rgb_pattern(lh, lw, seed=li)
+                else:
+                    arr = _pattern(lh, lw, seed=ci + 3 * li).astype(dtype)
+                    if dtype == np.uint16:
+                        arr = arr * np.uint16(200) + np.uint16(ci)
+                info.planes[(li, ci)] = arr
+                kind = "FullResolution" if li == 0 else "ReducedResolution"
+                page(arr, qpi_description(kind, None if rgb else name, color, objective,
+                                          f"CD{ci + 3}" if biomarkers else None),
+                     subfiletype=0 if li == 0 else 1, r=res / 2 ** li)
+            if li == 0:  # thumbnail sits after level 0, as in real files
+                page(np.full((64, 80, 3), 200, np.uint8), qpi_description("Thumbnail"),
+                     tiled=False, kw=dict(photometric="rgb"))
+        page(np.full((40, 90, 3), 120, np.uint8), qpi_description("Overview"),
+             tiled=False, kw=dict(photometric="rgb"))
+        page(np.full((30, 50, 3), 60, np.uint8), qpi_description("Label"),
+             tiled=False, kw=dict(photometric="rgb"))
+    return info
+
+
+def make_tiff(path: Path, width: int = 900, height: int = 700, rgb: bool = True,
+              dtype=np.uint8, tiled: bool = False, pyramid: int = 1,
+              mpp: float | None = 0.25, compression: str | None = "zlib") -> np.ndarray:
+    """Write a plain (non-Aperio) TIFF; returns the full-resolution image.
+    ``pyramid`` > 1 adds that many levels in total as SubIFDs."""
+    img = _rgb_pattern(height, width) if rgb else _pattern(height, width, 1).astype(dtype)
+    if not rgb and np.dtype(dtype) == np.uint16:
+        img = img * np.uint16(250)
+    kw = dict(photometric="rgb" if rgb else "minisblack", compression=compression,
+              metadata=None)
+    if mpp:
+        kw.update(resolution=(1e4 / mpp, 1e4 / mpp), resolutionunit="CENTIMETER")
+    with tifffile.TiffWriter(path, bigtiff=False) as t:
+        t.write(img, tile=(TS, TS) if tiled else None, rowsperstrip=None if tiled else 16,
+                subifds=pyramid - 1 if pyramid > 1 else None, **kw)
+        for li in range(1, pyramid):
+            t.write(img[::2 ** li, ::2 ** li], tile=(TS, TS) if tiled else None,
+                    subfiletype=1, **kw)
+    return img
