@@ -78,18 +78,29 @@ than a zoom factor.
 
 ## Quick Start (Zero Coding / Non-Technical Users)
 
-1. **Install Python 3.10+** from [python.org](https://www.python.org/downloads/).
-   During setup, tick **"Add Python to PATH"**.
-2. **Install the dependencies.** Open a command prompt in this folder and run:
+1. **Install Python** from [https://www.python.org/downloads/](https://www.python.org/downloads/).
+   On the first install screen, tick **"Add Python to PATH"**, then click
+   **Install Now**.
+2. **Open the converter folder** (the one that contains `requirements.txt`).
+3. **Click the address bar** at the top of that folder window, type `cmd` and
+   press Enter. A black window opens.
+4. **Type this and press Enter:**
    ```bash
    pip install -r requirements.txt
    ```
-3. **Copy both `kfbf_converter.py` and `run_converter.bat`** into the folder
+5. **Wait for "Successfully installed"**, then close the window.
+
+   If you see `Could not open requirements file`, the window opened in the
+   wrong folder. Type this instead and press Enter:
+   ```bash
+   pip install tifffile imagecodecs numpy pillow tqdm
+   ```
+6. **Copy both `kfbf_converter.py` and `run_converter.bat`** into the folder
    that contains your slides (`.tif`/`.tiff`, `.svs`, `.qptiff`, `.kfbf`). The
    launcher looks for the script next to itself, so the two files must stay
    together. *Or* keep them anywhere and **drag your slide folder onto
    `run_converter.bat`**.
-4. **Double-click `run_converter.bat`**. It counts the slides and asks what to
+7. **Double-click `run_converter.bat`**. It counts the slides and asks what to
    convert:
    ```text
    Found 12 TIFF, 3 SVS, 3 QPTIFF, 2 KFBF slide(s).
@@ -113,7 +124,7 @@ than a zoom factor.
    Enter choice [1-4] (Press Enter for 1):
    ```
    If the folder has only one type of slide, the first menu is skipped.
-5. **Wait for the summary** at the end, e.g.
+8. **Wait for the summary** at the end, e.g.
    `Converted 15, skipped 2 (already done), failed 1`, with a line per slide
    type and the reason for each failure.
 
@@ -380,6 +391,7 @@ used (**Image** tab → **Server type**) and share it.
 |---|---|
 | `Python is not installed or not in PATH` | Reinstall Python and tick **Add Python to PATH** |
 | `No module named ...` | Run `pip install -r requirements.txt` |
+| `Could not open requirements file` | The command window opened in the wrong folder. Run: `pip install tifffile imagecodecs numpy pillow tqdm` |
 | `No .tif/.tiff, .svs, .qptiff or .kfbf files found` | Put the slides in the same folder you run the converter from, or drag the folder onto `run_converter.bat` |
 | The "What do you want to convert?" menu doesn't appear | It only appears when the folder has more than one slide type and someone is at the keyboard. To choose types without it, use `--types` |
 | `this TIFF is damaged or incomplete and cannot be converted` | The file is truncated or corrupt (e.g. a copy that didn't finish, or a scanner TIFF over 4 GB saved as classic TIFF). Copy or export it again; the other slides still convert |
