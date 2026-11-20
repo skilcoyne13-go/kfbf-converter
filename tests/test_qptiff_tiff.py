@@ -2,8 +2,10 @@
 re-reading our own outputs, damaged TIFFs and the end-of-run summary."""
 
 import builtins
+import dataclasses
 import logging
 import os
+import re
 import shutil
 import xml.etree.ElementTree as ET
 
@@ -138,14 +140,64 @@ def test_qptiff_messages_never_say_kfbf(tmp_path, capsys):
     assert "kfbf" not in err.replace("kfbf_converter", "").lower()
 
 
+def _too_big_lines(err):
+    """The reason and Fix lines printed right under the headline."""
+    lines = err.splitlines()
+    assert lines.count(kc.DataTooBigError.HEADLINE) == 1, err
+    i = lines.index(kc.DataTooBigError.HEADLINE)
+    return lines[i + 1], lines[i + 2]
+
+
 def test_qptiff_preflight_too_big(tmp_path, monkeypatch, capsys):
     q = make_qptiff(tmp_path / "q.qptiff")
+    out = tmp_path / "out"
+    out.mkdir()
+    monkeypatch.setattr(kc, "filesystem_type", lambda p: "NTFS")
     monkeypatch.setattr(kc.shutil, "disk_usage",
                         lambda p: shutil._ntuple_diskusage(10 ** 12, 10 ** 12, 1000))
-    assert kc.main([str(q.path), "-o", str(tmp_path / "out"), "-q"]) == 1
+    assert kc.main([str(q.path), "-o", str(out), "-q"]) == 1
     err = capsys.readouterr().err
-    assert kc.DataTooBigError.HEADLINE in err and "q.ome.tif" in err
-    assert not (tmp_path / "out" / "q.ome.tif").exists()
+    reason, fix = _too_big_lines(err)
+    vol = re.escape(str(kc._volume_root(out)))
+    gb = r"\d+\.\d\d GB"
+    assert re.fullmatch(rf"  q\.ome\.tif: needs about {gb} \(plus a {gb} safety margin\), "
+                        rf"but only 0\.00 GB is free on {vol}\.", reason), reason
+    assert re.fullmatch(rf"  Fix: free up {gb} on {vol}, or choose another drive with -o\.",
+                        fix), fix
+    assert "kfbf" not in err.replace("kfbf_converter", "").lower()
+    assert "Traceback" not in err
+    assert os.listdir(out) == []                          # no output, no .part
+
+
+def test_tiff_preflight_too_big(tmp_path, monkeypatch, capsys):
+    src_dir = tmp_path / "in"
+    src_dir.mkdir()
+    make_tiff(src_dir / "photo.tif")
+    before = (src_dir / "photo.tif").read_bytes()
+    out = tmp_path / "out"
+    out.mkdir()
+    monkeypatch.setattr(kc, "filesystem_type", lambda p: "FAT32")
+    monkeypatch.setattr(kc.shutil, "disk_usage",
+                        lambda p: shutil._ntuple_diskusage(10 ** 15, 0, 10 ** 15))
+    real = kc.estimate_output
+
+    def fake(slide, kind, writer, copy_tiles=False):
+        est = real(slide, kind, writer, copy_tiles)
+        size = int(5.2 * kc.GiB)
+        return dataclasses.replace(est, estimate=size, uncompressed=max(size, est.uncompressed),
+                                   exact=False)
+    monkeypatch.setattr(kc, "estimate_output", fake)
+    assert kc.main([str(src_dir / "photo.tif"), "-o", str(out), "-q"]) == 1
+    err = capsys.readouterr().err
+    reason, fix = _too_big_lines(err)
+    assert reason == (f"  photo.tif: would be about 5.20 GB, but the output drive "
+                      f"{kc._volume_root(out)} is FAT32, which cannot store files larger "
+                      f"than 4.00 GB.")
+    assert fix.startswith("  Fix: choose an NTFS or exFAT drive with -o")
+    assert "kfbf" not in err.replace("kfbf_converter", "").lower()
+    assert "Traceback" not in err
+    assert os.listdir(out) == []                          # no output, no .part
+    assert (src_dir / "photo.tif").read_bytes() == before  # input untouched
 
 
 # ---- plain TIFF -------------------------------------------------------------------
